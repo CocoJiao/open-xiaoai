@@ -46,6 +46,10 @@ type Module struct {
 	// history 播放历史持久化（只针对故事/有声书）：记录"最近播放到哪个系列第几集"，
 	// 支撑"继续播放故事"跨会话/跨重启恢复。参见 history.go。
 	history *PlayHistoryStore
+
+	// musicHistory 普通音乐的播放断点（"继续播放"用），favorites 收藏列表。
+	musicHistory *MusicHistoryStore
+	favorites    *FavoritesStore
 }
 
 type lxResolver interface {
@@ -82,6 +86,9 @@ func New(cfg *MusicConfig) *Module {
 		lx:      lx,
 		jobWake: make(chan struct{}, 1),
 		history: NewPlayHistoryStore(cfg.History.File),
+
+		musicHistory: NewMusicHistoryStore(cfg.History.MusicFile),
+		favorites:    NewFavoritesStore(cfg.History.FavoritesFile),
 	}
 }
 
@@ -120,6 +127,12 @@ func (m *Module) Start(ctx context.Context) error {
 		WithOnEpisodeChange(func(item SongItem) {
 			m.history.Update(item.SeriesName, item.Episode, item.Path)
 		}),
+		WithOnSongChange(func(item SongItem) {
+			if item.Episode > 0 {
+				return
+			}
+			m.recordMusicProgress()
+		}),
 	)
 
 	// 先尝试加载磁盘缓存，让 Start 立刻就能用到已有曲库。
@@ -130,6 +143,12 @@ func (m *Module) Start(ctx context.Context) error {
 	}
 	if err := m.history.Load(); err != nil {
 		log.Printf("⚠️ [music] 加载播放历史失败: %v", err)
+	}
+	if err := m.musicHistory.Load(); err != nil {
+		log.Printf("⚠️ [music] 加载音乐断点失败: %v", err)
+	}
+	if err := m.favorites.Load(); err != nil {
+		log.Printf("⚠️ [music] 加载收藏失败: %v", err)
 	}
 
 	// 启动 HTTP 文件服务
@@ -292,6 +311,7 @@ func (m *Module) Stop() error {
 		cancel()
 	}
 	if m.player != nil {
+		m.recordMusicProgress()
 		m.player.ClearQueue()
 	}
 	if closer, ok := m.lx.(io.Closer); ok {
@@ -379,9 +399,35 @@ func (m *Module) classifyInstruction(text, normalized string) func() {
 	}
 
 	switch {
+	case m.matchExact(normalized, m.config.Commands.PauseKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 pause_keywords")
+			m.handlePause()
+		}
+	case m.matchExact(normalized, m.config.Commands.ResumeKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 resume_keywords")
+			m.handleResume()
+		}
+	case m.matchExact(normalized, m.config.Commands.FavoriteRemoveKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 favorite_remove_keywords")
+			m.handleFavorite(false)
+		}
+	case m.matchExact(normalized, m.config.Commands.FavoriteAddKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 favorite_add_keywords")
+			m.handleFavorite(true)
+		}
+	case m.matchExact(normalized, m.config.Commands.PlayFavoritesKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 play_favorites_keywords")
+			m.handlePlayFavorites()
+		}
 	case m.matchExact(normalized, m.config.Commands.StopKeywords):
 		return func() {
 			log.Printf("🎯 [music] 命中 stop_keywords")
+			m.recordMusicProgress()
 			m.player.ClearQueue()
 			_ = m.player.Stop()
 			m.player.Speak("好的，已停止")
@@ -567,6 +613,9 @@ func (m *Module) applyDefaultStoryContext(intent PlayIntent) PlayIntent {
 }
 
 func (m *Module) handlePlay(keyword string) bool {
+	if artist, ok := ParseArtistIntent(keyword); ok {
+		return m.handleArtistPlay(artist)
+	}
 	intent := ParsePlayIntent(keyword)
 	intent = m.applyDefaultStoryContext(intent)
 	return m.playIntent(intent, false)
@@ -790,8 +839,10 @@ func (m *Module) handleLXPlay(keyword string) bool {
 	_ = m.player.Speak(fmt.Sprintf("好的，当前播放的是在线歌曲%s", name))
 	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue([]SongItem{{
-		Path: fmt.Sprintf("lx:%s-%s", track.Singer, name),
-		URL:  track.URL,
+		Path:   fmt.Sprintf("lx:%s-%s", track.Singer, name),
+		URL:    track.URL,
+		Title:  name,
+		Singer: track.Singer,
 	}})
 	return true
 }

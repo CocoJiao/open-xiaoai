@@ -85,8 +85,84 @@ func (c *LXClient) Resolve(ctx context.Context, keyword string) (*LXTrack, error
 	if len(songs) == 0 {
 		return nil, fmt.Errorf("lx no result for %q", keyword)
 	}
+	return resolveRanked(keyword, songs, func(s lxSongInfo) (*LXTrack, error) {
+		return c.fetchURL(ctx, s)
+	})
+}
 
-	return c.fetchURL(ctx, songs[0])
+// LXCandidate 在线搜索结果（尚未取直链）。直链有时效，"XX的歌"一次入队多首时
+// 先只保存候选，播到那一首时再取直链。
+type LXCandidate struct {
+	Name   string
+	Singer string
+	info   lxSongInfo
+}
+
+// lxArtistSearcher 可选能力："XX的歌"按歌手搜多首 + 延迟取直链。
+// LXClient 和 EmbeddedLX 都实现了；单独定义成可选接口，避免强迫测试替身实现。
+type lxArtistSearcher interface {
+	SearchArtistSongs(ctx context.Context, artist string, limit int) ([]LXCandidate, error)
+	ResolveCandidate(ctx context.Context, c LXCandidate) (*LXTrack, error)
+}
+
+// resolveRanked 对搜索结果重新打分，按分数依次尝试取直链（最多 lxResolveMaxAttempts 个）。
+func resolveRanked(keyword string, songs []lxSongInfo, fetch func(lxSongInfo) (*LXTrack, error)) (*LXTrack, error) {
+	ranked := rankLXSongs(keyword, songs)
+	var lastErr error
+	for i, s := range ranked {
+		if i >= lxResolveMaxAttempts {
+			break
+		}
+		log.Printf("🌐 [music/lx] 候选#%d: name=%q singer=%q (原始排名=%d)", i+1,
+			stringField(s, "name"), stringField(s, "singer"), indexOfSong(songs, s))
+		track, err := fetch(s)
+		if err == nil && track != nil && track.URL != "" {
+			return track, nil
+		}
+		if err == nil {
+			err = errors.New("empty url")
+		}
+		log.Printf("⚠️ [music/lx] 候选#%d 取直链失败，尝试下一个: %v", i+1, err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func indexOfSong(songs []lxSongInfo, target lxSongInfo) int {
+	for i, s := range songs {
+		if fmt.Sprintf("%p", s) == fmt.Sprintf("%p", target) {
+			return i
+		}
+	}
+	return -1
+}
+
+func candidatesFromSongs(songs []lxSongInfo) []LXCandidate {
+	out := make([]LXCandidate, len(songs))
+	for i, s := range songs {
+		out[i] = LXCandidate{Name: stringField(s, "name"), Singer: stringField(s, "singer"), info: s}
+	}
+	return out
+}
+
+// SearchArtistSongs 实现 lxArtistSearcher。
+func (c *LXClient) SearchArtistSongs(ctx context.Context, artist string, limit int) ([]LXCandidate, error) {
+	if err := c.ensureUserToken(ctx); err != nil {
+		return nil, err
+	}
+	songs, err := c.search(ctx, artist)
+	if err != nil {
+		return nil, err
+	}
+	return candidatesFromSongs(filterLXSongsBySinger(artist, songs, limit)), nil
+}
+
+// ResolveCandidate 实现 lxArtistSearcher。
+func (c *LXClient) ResolveCandidate(ctx context.Context, cand LXCandidate) (*LXTrack, error) {
+	if err := c.ensureUserToken(ctx); err != nil {
+		return nil, err
+	}
+	return c.fetchURL(ctx, cand.info)
 }
 
 func (c *LXClient) search(ctx context.Context, keyword string) ([]lxSongInfo, error) {

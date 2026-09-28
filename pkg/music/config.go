@@ -19,6 +19,10 @@ type MusicConfig struct {
 // "继续播放故事"语音指令。普通音乐/在线歌曲不记录（没有"集"的概念）。
 type HistoryConfig struct {
 	File string `yaml:"file"` // 历史记录文件路径，空则用默认值 cache/play_history.json
+	// MusicFile 普通音乐播放断点（"继续播放"用），空则用 cache/music_history.json
+	MusicFile string `yaml:"music_file"`
+	// FavoritesFile 收藏列表，空则用 cache/favorites.json
+	FavoritesFile string `yaml:"favorites_file"`
 }
 
 // StoryConfig 故事/有声书配置
@@ -53,6 +57,17 @@ type CommandsConfig struct {
 	// 最近一次系列名+集数，自动接着播放，不需要用户报出系列名。只针对故事/有声书场景，
 	// 刻意不做成通用的"继续播放"（避免和普通音乐/暂停恢复语义混淆）。
 	ContinueStoryKeywords []string `yaml:"continue_story_keywords"`
+
+	// PauseKeywords 真正的暂停：保留队列和进度，"继续播放"可原地恢复。
+	// 优先级高于 stop_keywords（旧配置里 stop_keywords 含"暂停"也会按暂停处理）。
+	PauseKeywords []string `yaml:"pause_keywords"`
+	// ResumeKeywords "继续播放"：暂停中原地恢复；否则按音乐断点（没有则按故事历史）接着播。
+	ResumeKeywords []string `yaml:"resume_keywords"`
+	// FavoriteAddKeywords / FavoriteRemoveKeywords 收藏/取消收藏当前歌曲
+	FavoriteAddKeywords    []string `yaml:"favorite_add_keywords"`
+	FavoriteRemoveKeywords []string `yaml:"favorite_remove_keywords"`
+	// PlayFavoritesKeywords 播放收藏列表
+	PlayFavoritesKeywords []string `yaml:"play_favorites_keywords"`
 
 	// AbortXiaoAIOnPlay：handlePlay 时是否同步重启 mico_aivs_lab，杀掉小爱云端 NLP 流水线。
 	// 解决"我们 player_play_url 本地歌后，小爱云端识别同一句话再返回试听版 URL 覆盖我们"的竞态。
@@ -167,7 +182,7 @@ const DefaultEpisodePattern = `第?(\d+)[集回]?`
 var DefaultCommands = CommandsConfig{
 	PlayKeywords:     []string{"播放"},
 	DownloadKeywords: []string{"下载"},
-	StopKeywords:     []string{"停止播放", "暂停播放", "暂停", "停止", "闭嘴", "别放了", "不要放了", "关机"},
+	StopKeywords:     []string{"停止播放", "停止", "闭嘴", "别放了", "不要放了", "关机"},
 	// 覆盖"首/个"（普通音乐语境）和"集/章/回"（故事/有声书按集播放语境）两类说法，
 	// 否则用户在听故事时说"下一集"会因为 matchExact 精确匹配不上"下一首"而被当成
 	// 非音乐指令直接忽略（实测过的真实 bug）。
@@ -181,6 +196,15 @@ var DefaultCommands = CommandsConfig{
 	ContinueStoryKeywords: []string{
 		"继续播放故事", "接着播放故事", "继续听故事", "接着听故事",
 		"继续讲故事", "接着讲故事", "继续故事", "接着故事",
+	},
+	PauseKeywords:  []string{"暂停", "暂停播放", "暂停一下", "先暂停"},
+	ResumeKeywords: []string{"继续播放", "继续", "接着播放", "接着放", "继续放", "恢复播放", "继续听", "接着听"},
+	FavoriteAddKeywords: []string{
+		"加入收藏", "收藏", "收藏这首", "收藏这首歌", "收藏歌曲", "我喜欢这首歌", "喜欢这首歌",
+	},
+	FavoriteRemoveKeywords: []string{"取消收藏", "取消收藏这首", "取消收藏这首歌", "不喜欢这首歌", "从收藏里删除"},
+	PlayFavoritesKeywords: []string{
+		"播放收藏", "播放我的收藏", "播放收藏歌单", "播放歌单收藏", "听收藏", "播放收藏的歌", "播放我收藏的歌",
 	},
 }
 
@@ -198,6 +222,12 @@ func (c *MusicConfig) ApplyDefaults() {
 	}
 	if c.History.File == "" {
 		c.History.File = "cache/play_history.json"
+	}
+	if c.History.MusicFile == "" {
+		c.History.MusicFile = "cache/music_history.json"
+	}
+	if c.History.FavoritesFile == "" {
+		c.History.FavoritesFile = "cache/favorites.json"
 	}
 	if c.LX.Source == "" {
 		c.LX.Source = "kw"
@@ -252,6 +282,16 @@ func (c *MusicConfig) ApplyDefaults() {
 		c.Commands.ContinueStoryKeywords = make([]string, len(DefaultCommands.ContinueStoryKeywords))
 		copy(c.Commands.ContinueStoryKeywords, DefaultCommands.ContinueStoryKeywords)
 	}
+	fill := func(dst *[]string, def []string) {
+		if len(*dst) == 0 {
+			*dst = append([]string(nil), def...)
+		}
+	}
+	fill(&c.Commands.PauseKeywords, DefaultCommands.PauseKeywords)
+	fill(&c.Commands.ResumeKeywords, DefaultCommands.ResumeKeywords)
+	fill(&c.Commands.FavoriteAddKeywords, DefaultCommands.FavoriteAddKeywords)
+	fill(&c.Commands.FavoriteRemoveKeywords, DefaultCommands.FavoriteRemoveKeywords)
+	fill(&c.Commands.PlayFavoritesKeywords, DefaultCommands.PlayFavoritesKeywords)
 	if c.Commands.AbortXiaoAIOnPlay == nil {
 		// 默认开启：解决小爱云端 NLP 抢占本地播放的竞态问题
 		t := true

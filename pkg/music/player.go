@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,9 @@ type PlaybackState int
 const (
 	StateIdle PlaybackState = iota
 	StatePlaying
+	// StatePaused 用户说"暂停"后进入：队列和当前曲都保留，"继续播放"用 mphelper play 原地恢复。
+	// 这期间设备上报的 Idle 一律不当成"播完了"，避免暂停被误判成切歌。
+	StatePaused
 )
 
 // PlaybackMode controls how the queue advances when a song ends.
@@ -106,6 +110,9 @@ const (
 	// 同时足以覆盖"物理暂停键按下时track 通常远没播完"这种典型场景。
 	// 只对能解析出真实时长的 .mp3 生效（IndexedSong.DurationMs>0）。
 	earlyIdleThresholdRatio = 0.7
+
+	// seekDelay 断点续播时 PlayURL 之后等多久再 seek
+	seekDelay = 1200 * time.Millisecond
 )
 
 // SongItem 队列中的歌曲项
@@ -125,6 +132,41 @@ type SongItem struct {
 	// 仅故事/有声书队列会填充；普通音乐/在线歌曲为空。用于 onEpisodeChange 回调记录
 	// "最近播放到哪个系列第几集"，支撑"继续播放故事"语音指令，不参与播放本身的逻辑。
 	SeriesName string
+	// Title / Singer 用于"加入收藏"和"继续播放"的记录与播报；本地歌曲来自文件名，
+	// 在线歌曲来自 LX 搜索结果。
+	Title  string
+	Singer string
+	// Resolve 延迟取直链：URL 为空时，播到这一首才调用。用于"XX的歌"一次入队多首在线歌曲
+	// （直链有时效，而且逐首取直链很慢）。不参与持久化。
+	Resolve func() (string, error) `json:"-"`
+	// StartOffsetMs 从这个位置开始播（"继续播放"恢复断点用），0 表示从头。
+	StartOffsetMs int64
+}
+
+// IsOnline 是否为在线歌曲（没有本地文件，直链会过期）。
+func (s SongItem) IsOnline() bool {
+	return strings.HasPrefix(s.Path, "lx:")
+}
+
+// DisplayName 播报用的歌名。
+func (s SongItem) DisplayName() string {
+	if s.Title != "" {
+		return s.Title
+	}
+	if s.IsOnline() {
+		return strings.TrimPrefix(s.Path, "lx:")
+	}
+	base := filepath.Base(s.Path)
+	return strings.TrimSuffix(base, filepath.Ext(base))
+}
+
+// PlaybackSnapshot 当前播放现场：当前曲 + 位置 + 剩余队列。用于记录"继续播放"的断点。
+type PlaybackSnapshot struct {
+	Current    SongItem
+	PositionMs int64
+	Remaining  []SongItem
+	Mode       PlaybackMode
+	Paused     bool
 }
 
 // Player 播放器：队列、RPC 调用、Idle 切歌
@@ -173,6 +215,17 @@ type Player struct {
 	// 不参与播放决策"：回调里不能反过来调用 Player 上任何需要 p.mu 的方法。
 	// nil 表示未启用（比如没有配置 history.file）。
 	onEpisodeChange func(item SongItem)
+
+	// onSongChange 每次成功开始播放一首（任意类型）时异步触发，用于记录音乐播放断点。
+	onSongChange func(item SongItem)
+
+	// pausedAt 进入 StatePaused 的时间；恢复时把 lastPlayURLAt 顺延暂停时长，
+	// 这样播放进度估算、看门狗、早停判断都不会把暂停时间算进去。
+	pausedAt time.Time
+	// currentOffset 当前曲是从哪个位置开始播的（断点续播时非 0），用于估算播放进度。
+	currentOffset time.Duration
+	// seek 可覆盖的跳进度入口（测试用）
+	seek func(positionMs int64) error
 
 	// initialStateCh 在收到第一个 playing 事件时关闭，用来给上层"等一下首个状态"的能力，
 	// 取代之前注释里建议的 Sleep 推断（不可靠）。
@@ -229,6 +282,13 @@ func WithEpisodeAnnouncement(enabled bool) PlayerOption {
 func WithOnEpisodeChange(fn func(item SongItem)) PlayerOption {
 	return func(p *Player) {
 		p.onEpisodeChange = fn
+	}
+}
+
+// WithOnSongChange 注册"开始播放新一首"的回调（异步调用），用于记录音乐播放断点。
+func WithOnSongChange(fn func(item SongItem)) PlayerOption {
+	return func(p *Player) {
+		p.onSongChange = fn
 	}
 }
 
@@ -343,6 +403,136 @@ func (p *Player) Stop() error {
 	if err != nil {
 		log.Printf("❌ [music/player] Stop RPC 失败: %v", err)
 	}
+	return err
+}
+
+// Pause 真正的暂停：保留当前曲和队列，进入 StatePaused。
+// 返回 false 表示当前没有我方在播放的内容（交给调用方决定播报什么）。
+func (p *Player) Pause() bool {
+	p.mu.Lock()
+	if p.currentSong == nil || p.state != StatePlaying {
+		p.mu.Unlock()
+		return false
+	}
+	p.state = StatePaused
+	p.pausedAt = time.Now()
+	p.mu.Unlock()
+
+	if _, err := p.runShellCommand("mphelper pause", 2000); err != nil {
+		log.Printf("❌ [music/player] Pause RPC 失败: %v", err)
+		p.mu.Lock()
+		p.state = StatePlaying
+		p.pausedAt = time.Time{}
+		p.mu.Unlock()
+		return false
+	}
+	log.Printf("⏸️ [music/player] 已暂停 (位置≈%v)", time.Duration(p.PositionMs())*time.Millisecond)
+	return true
+}
+
+// Resume 从暂停处原地恢复。返回 false 表示当前不在暂停状态（比如服务重启过、已经被停止），
+// 调用方应退回到"按播放记录重新播放"。
+func (p *Player) Resume() bool {
+	p.mu.Lock()
+	if p.state != StatePaused || p.currentSong == nil {
+		p.mu.Unlock()
+		return false
+	}
+	p.mu.Unlock()
+
+	if _, err := p.runShellCommand("mphelper play", 2000); err != nil {
+		log.Printf("❌ [music/player] Resume RPC 失败: %v", err)
+		return false
+	}
+	p.mu.Lock()
+	p.markResumedLocked(time.Now())
+	p.mu.Unlock()
+	log.Printf("▶️ [music/player] 已从暂停处恢复")
+	return true
+}
+
+// markResumedLocked 暂停结束：把暂停时长补进 lastPlayURLAt，状态回到 Playing。
+func (p *Player) markResumedLocked(now time.Time) {
+	if !p.pausedAt.IsZero() && !p.lastPlayURLAt.IsZero() {
+		p.lastPlayURLAt = p.lastPlayURLAt.Add(now.Sub(p.pausedAt))
+	}
+	p.pausedAt = time.Time{}
+	p.state = StatePlaying
+}
+
+// IsPaused 是否处于用户暂停状态。
+func (p *Player) IsPaused() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state == StatePaused
+}
+
+// PositionMs 估算当前曲的播放位置（毫秒）。设备端没有可靠的进度查询接口，
+// 用"开始播放时间 + 起播偏移 - 暂停时长"估算，精度在秒级，足够断点续播用。
+func (p *Player) PositionMs() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.positionLocked(time.Now()).Milliseconds()
+}
+
+func (p *Player) positionLocked(now time.Time) time.Duration {
+	if p.currentSong == nil || p.lastPlayURLAt.IsZero() {
+		return 0
+	}
+	end := now
+	if p.state == StatePaused && !p.pausedAt.IsZero() {
+		end = p.pausedAt
+	}
+	pos := p.currentOffset + end.Sub(p.lastPlayURLAt)
+	if pos < 0 {
+		pos = 0
+	}
+	if p.currentSong.DurationMs > 0 {
+		if d := time.Duration(p.currentSong.DurationMs) * time.Millisecond; pos > d {
+			pos = d
+		}
+	}
+	return pos
+}
+
+// CurrentSong 返回当前曲（副本），没有时 ok=false。
+func (p *Player) CurrentSong() (SongItem, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.currentSong == nil {
+		return SongItem{}, false
+	}
+	return *p.currentSong, true
+}
+
+// Snapshot 返回当前播放现场，没有当前曲时 ok=false。
+func (p *Player) Snapshot() (PlaybackSnapshot, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.currentSong == nil {
+		return PlaybackSnapshot{}, false
+	}
+	return PlaybackSnapshot{
+		Current:    *p.currentSong,
+		PositionMs: p.positionLocked(time.Now()).Milliseconds(),
+		Remaining:  copySongItems(p.queue),
+		Mode:       p.mode,
+		Paused:     p.state == StatePaused,
+	}, true
+}
+
+// seekTo 跳到指定位置。固件的方法名就是 player_set_positon（官方 typo，见 docs/shells/README.md）。
+// 失败只记日志：最坏结果是从头播放，不影响播放本身。
+func (p *Player) seekTo(positionMs int64) error {
+	if p.seek != nil {
+		return p.seek(positionMs)
+	}
+	script := fmt.Sprintf(
+		`ubus -t 2 call mediaplayer player_set_positon '{"position":%d,"media":"common"}' 2>&1 || true`,
+		positionMs,
+	)
+	out, err := p.runShellCommand(script, 3000)
+	log.Printf("⏩ [music/player] seek → %dms: %s err=%v", positionMs, summarizeShellText(out), err)
 	return err
 }
 
@@ -557,6 +747,10 @@ func (p *Player) ClearQueue() {
 	p.playlist = nil
 	p.history = nil
 	p.currentSong = nil
+	if p.state == StatePaused {
+		p.state = StateIdle
+	}
+	p.pausedAt = time.Time{}
 	p.mu.Unlock()
 	if hadSong || oldLen > 0 {
 		log.Printf("🧹 [music/player] ClearQueue (剩余队列=%d, 有当前曲=%v)", oldLen, hadSong)
@@ -575,6 +769,7 @@ func (p *Player) SetQueue(items []SongItem) bool {
 	p.playlist = copySongItems(items)
 	p.history = nil
 	p.currentSong = nil
+	p.pausedAt = time.Time{}
 	log.Printf("🎵 [music/player] SetQueue: %d 首", len(p.queue))
 	if len(p.queue) == 0 {
 		return false
@@ -621,6 +816,8 @@ func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) boo
 		p.history = append(p.history, *p.currentSong)
 	}
 	p.currentSong = &item
+	p.pausedAt = time.Time{}
+	p.currentOffset = time.Duration(item.StartOffsetMs) * time.Millisecond
 	// 主动设 Playing：
 	// 1) 切歌时 PlayingMonitor 可能不会再上报"Playing"（如果之前已经是 Playing 且 mute_stat 没变化）。
 	//    如果这里不主动设，state 会停在 Idle / 旧值，下次真的播完上报 Idle 时 state != Playing，
@@ -634,7 +831,32 @@ func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) boo
 		// 播报必须先于 PlayURL 且同步等待播完，保证小朋友先听到"第几集"，再听到正文内容。
 		_ = p.Speak(fmt.Sprintf("现在播放第%d集", item.Episode))
 	}
-	err := p.PlayURL(item.URL)
+	playURL := item.URL
+	if playURL == "" && item.Resolve != nil {
+		// 延迟取直链（"XX的歌"在线队列）。在锁外执行：网络请求可能要几秒。
+		u, rerr := item.Resolve()
+		if rerr != nil || u == "" {
+			p.mu.Lock()
+			log.Printf("⚠️ [music/player] 在线歌曲取直链失败，跳过: %s err=%v", item.Path, rerr)
+			p.currentSong = nil
+			if p.state == StatePlaying {
+				p.state = StateIdle
+			}
+			return p.playNextLocked(false, announce)
+		}
+		playURL = u
+	}
+	err := p.PlayURL(playURL)
+	if err == nil && item.StartOffsetMs > 0 {
+		// mediaplayer 刚收到 URL 还在缓冲，立刻 seek 常被忽略，稍等再跳。
+		if p.seek == nil {
+			time.Sleep(seekDelay)
+		}
+		if serr := p.seekTo(item.StartOffsetMs); serr != nil {
+			item.StartOffsetMs = 0
+		}
+	}
+	seekFailed := item.StartOffsetMs == 0
 	p.mu.Lock()
 	if err != nil {
 		log.Printf("❌ [music/player] 播放失败: %v (path=%s)", err, item.Path)
@@ -642,7 +864,19 @@ func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) boo
 		p.state = StateIdle
 		return false
 	}
+	if p.currentSong != nil && p.currentSong.Path == item.Path {
+		// 断点只用一次：之后的单曲循环/上一首都从头播
+		if seekFailed {
+			p.currentOffset = 0
+		}
+		p.currentSong.StartOffsetMs = 0
+		p.currentSong.URL = playURL
+	}
 	log.Printf("🎵 [music/player] 正在播放: %s (剩余队列=%d 历史=%d)", item.Path, queueLen, histLen)
+	if p.onSongChange != nil {
+		cb := p.onSongChange
+		go cb(item)
+	}
 	if p.onEpisodeChange != nil && item.Episode > 0 {
 		// 异步触发：磁盘 IO 不应该占用 p.mu、也不应该拖慢播放主流程。
 		cb := p.onEpisodeChange
@@ -680,6 +914,15 @@ func (p *Player) OnPlayingStatus(status string) {
 	}
 
 	prev := p.state
+	if prev == StatePaused {
+		// 用户暂停期间：Idle/Paused 都是暂停本身造成的，不能当"播完"切歌；
+		// 收到 Playing 说明被外部恢复了（比如按了设备播放键），同步回 Playing。
+		if status == "Playing" && p.currentSong != nil {
+			log.Printf("🎚️ [music/player] 暂停中收到 Playing，视为外部恢复播放")
+			p.markResumedLocked(now)
+		}
+		return
+	}
 	switch status {
 	case "Idle":
 		if p.state != StatePlaying {
@@ -711,7 +954,8 @@ func (p *Player) OnPlayingStatus(status string) {
 			// 自动续播"。对分集内容优先保证连续播放，早期 Idle 仍然按自然播完去续下一集。
 			if p.currentSong.DurationMs > 0 && p.currentSong.Episode <= 0 {
 				expected := time.Duration(p.currentSong.DurationMs) * time.Millisecond
-				since := now.Sub(p.lastPlayURLAt)
+				// 断点续播时从 currentOffset 开始，按实际播放位置比较
+				since := p.currentOffset + now.Sub(p.lastPlayURLAt)
 				if since < time.Duration(float64(expected)*earlyIdleThresholdRatio) {
 					log.Printf("⏸️ [music/player] 忽略 Idle: 只播放了 %v/%v (<%.0f%%)，判定为设备被手动暂停/停止"+
 						"（比如按了物理暂停键），不自动切下一首",
@@ -884,7 +1128,7 @@ func (p *Player) BuildQueueFromSongs(songs []IndexedSong, seriesName string) []S
 		p.fileServer.AllowFile(s.Path)
 		url := p.fileServer.CreateFileURL(s.Path)
 		if url != "" {
-			items = append(items, SongItem{Path: s.Path, URL: url, Size: s.Size, DurationMs: s.DurationMs, Episode: s.Episode, SeriesName: seriesName})
+			items = append(items, SongItem{Path: s.Path, URL: url, Size: s.Size, DurationMs: s.DurationMs, Episode: s.Episode, SeriesName: seriesName, Singer: s.ArtistLower})
 		} else {
 			skipped++
 			log.Printf("⚠️ [music/player] BuildQueue 跳过 (URL 生成失败): %s", s.Path)
@@ -988,7 +1232,7 @@ func (p *Player) checkWatchdog() {
 	if maxMargin := time.Duration(float64(dur) * preemptMaxMarginRatio); margin > maxMargin {
 		margin = maxMargin
 	}
-	preemptAt := p.lastPlayURLAt.Add(dur - margin)
+	preemptAt := p.lastPlayURLAt.Add(dur - margin - p.currentOffset)
 	if now.Before(preemptAt) {
 		return
 	}

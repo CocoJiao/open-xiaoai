@@ -88,9 +88,17 @@ func (e *EmbeddedLX) Resolve(ctx context.Context, keyword string) (*LXTrack, err
 	if len(songs) == 0 {
 		return nil, fmt.Errorf("lx-embedded no result for %q", keyword)
 	}
-	song := songs[0]
-	log.Printf("🌐 [music/lx-embedded] search response: 音源=%s count=%d first=%s", sourceName, len(songs), briefJSON(song))
+	log.Printf("🌐 [music/lx-embedded] search response: 音源=%s count=%d first=%s", sourceName, len(songs), briefJSON(songs[0]))
+	infos := make([]lxSongInfo, len(songs))
+	for i, s := range songs {
+		infos[i] = s
+	}
+	return resolveRanked(keyword, infos, func(s lxSongInfo) (*LXTrack, error) {
+		return e.resolveSong(ctx, s)
+	})
+}
 
+func (e *EmbeddedLX) resolveSong(ctx context.Context, song lxSongInfo) (*LXTrack, error) {
 	log.Printf("🌐 [music/lx-embedded] url request: song=%s quality=%s", briefJSON(song), e.quality)
 	remoteURL, urlSourceName, err := e.registry.ResolveURL(ctx, e.source, song, e.quality)
 	if err != nil {
@@ -105,6 +113,32 @@ func (e *EmbeddedLX) Resolve(ctx context.Context, keyword string) (*LXTrack, err
 		Quality: e.quality,
 		URL:     remoteURL,
 	}, nil
+}
+
+// SearchArtistSongs 实现 lxArtistSearcher："XX的歌"按歌手名搜索，只保留歌手匹配的结果。
+func (e *EmbeddedLX) SearchArtistSongs(ctx context.Context, artist string, limit int) ([]LXCandidate, error) {
+	if e == nil || e.registry == nil {
+		return nil, fmt.Errorf("embedded lx-go is not initialized")
+	}
+	songs, sourceName, err := e.registry.Search(ctx, e.source, strings.TrimSpace(artist), 50)
+	if err != nil {
+		return nil, fmt.Errorf("lx-embedded search failed: %w", err)
+	}
+	infos := make([]lxSongInfo, len(songs))
+	for i, s := range songs {
+		infos[i] = s
+	}
+	filtered := filterLXSongsBySinger(artist, infos, limit)
+	log.Printf("🌐 [music/lx-embedded] artist search: 音源=%s artist=%q 原始=%d 歌手匹配=%d", sourceName, artist, len(songs), len(filtered))
+	return candidatesFromSongs(filtered), nil
+}
+
+// ResolveCandidate 实现 lxArtistSearcher。
+func (e *EmbeddedLX) ResolveCandidate(ctx context.Context, c LXCandidate) (*LXTrack, error) {
+	if e == nil || e.registry == nil {
+		return nil, fmt.Errorf("embedded lx-go is not initialized")
+	}
+	return e.resolveSong(ctx, c.info)
 }
 
 // Download 实现 lxResolver：把 track.URL 指向的直链下载保存到本地。
