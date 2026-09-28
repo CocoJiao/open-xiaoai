@@ -297,3 +297,39 @@ func (m *Module) handleArtistPlay(artist string) bool {
 	// 兜底：当普通关键词处理（本地模糊搜索 → 在线单曲）
 	return m.playIntent(PlayIntent{SeriesName: artist}, false)
 }
+
+// classifyShortCommand 处理短控制口令（暂停/继续/下一首/上一首/收藏/取消收藏）。
+// session_only_short_commands 开启时，只在音乐会话活跃时接管；否则返回 nil，
+// 让这句话继续走后面的分支，最终交还给上层 AI/小爱。
+func (m *Module) classifyShortCommand(normalized string) func() {
+	type shortCmd struct {
+		name     string
+		keywords []string
+		run      func()
+	}
+	c := m.config.Commands
+	cmds := []shortCmd{
+		{"pause_keywords", c.PauseKeywords, func() { m.handlePause() }},
+		{"resume_short_keywords", c.ResumeShortKeywords, func() { m.handleResume() }},
+		{"favorite_remove_keywords", c.FavoriteRemoveKeywords, func() { m.handleFavorite(false) }},
+		{"favorite_add_keywords", c.FavoriteAddKeywords, func() { m.handleFavorite(true) }},
+		{"next_keywords", c.NextKeywords, func() { m.handleNext() }},
+		{"previous_keywords", c.PreviousKeywords, func() { m.handlePrevious() }},
+	}
+	for _, cmd := range cmds {
+		if !m.matchExact(normalized, cmd.keywords) {
+			continue
+		}
+		gated := c.SessionOnlyShortCommands == nil || *c.SessionOnlyShortCommands
+		if gated && (m.player == nil || !m.player.HasSession()) {
+			log.Printf("⏭️ [music] 命中 %s 但当前没有音乐会话，交还给上层: %q", cmd.name, normalized)
+			return nil
+		}
+		name, run := cmd.name, cmd.run
+		return func() {
+			log.Printf("🎯 [music] 命中 %s", name)
+			run()
+		}
+	}
+	return nil
+}

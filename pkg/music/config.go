@@ -61,8 +61,16 @@ type CommandsConfig struct {
 	// PauseKeywords 真正的暂停：保留队列和进度，"继续播放"可原地恢复。
 	// 优先级高于 stop_keywords（旧配置里 stop_keywords 含"暂停"也会按暂停处理）。
 	PauseKeywords []string `yaml:"pause_keywords"`
-	// ResumeKeywords "继续播放"：暂停中原地恢复；否则按音乐断点（没有则按故事历史）接着播。
+	// ResumeKeywords 明确的"继续播放"：任何时候都生效。暂停中原地恢复；否则按音乐断点
+	// （或故事历史，取更新的那个）接着播。
 	ResumeKeywords []string `yaml:"resume_keywords"`
+	// ResumeShortKeywords 短口令"继续/接着听"：只在音乐会话活跃时生效（见 SessionOnlyShortCommands）。
+	ResumeShortKeywords []string `yaml:"resume_short_keywords"`
+
+	// SessionOnlyShortCommands 为 true（默认）时，短控制口令（暂停、继续、下一首、上一首、
+	// 收藏/取消收藏）只在音乐会话活跃（有当前曲，播放中或暂停中）时才由音乐模块接管；
+	// 否则交还给上层 AI/小爱，避免聊天时说"继续""下一个"被音乐模块截胡。
+	SessionOnlyShortCommands *bool `yaml:"session_only_short_commands,omitempty"`
 	// FavoriteAddKeywords / FavoriteRemoveKeywords 收藏/取消收藏当前歌曲
 	FavoriteAddKeywords    []string `yaml:"favorite_add_keywords"`
 	FavoriteRemoveKeywords []string `yaml:"favorite_remove_keywords"`
@@ -197,8 +205,9 @@ var DefaultCommands = CommandsConfig{
 		"继续播放故事", "接着播放故事", "继续听故事", "接着听故事",
 		"继续讲故事", "接着讲故事", "继续故事", "接着故事",
 	},
-	PauseKeywords:  []string{"暂停", "暂停播放", "暂停一下", "先暂停"},
-	ResumeKeywords: []string{"继续播放", "继续", "接着播放", "接着放", "继续放", "恢复播放", "继续听", "接着听"},
+	PauseKeywords:       []string{"暂停", "暂停播放", "暂停一下", "先暂停"},
+	ResumeKeywords:      []string{"继续播放", "接着播放", "恢复播放"},
+	ResumeShortKeywords: []string{"继续", "接着放", "继续放", "继续听", "接着听"},
 	FavoriteAddKeywords: []string{
 		"加入收藏", "收藏", "收藏这首", "收藏这首歌", "收藏歌曲", "我喜欢这首歌", "喜欢这首歌",
 	},
@@ -289,6 +298,11 @@ func (c *MusicConfig) ApplyDefaults() {
 	}
 	fill(&c.Commands.PauseKeywords, DefaultCommands.PauseKeywords)
 	fill(&c.Commands.ResumeKeywords, DefaultCommands.ResumeKeywords)
+	fill(&c.Commands.ResumeShortKeywords, DefaultCommands.ResumeShortKeywords)
+	if c.Commands.SessionOnlyShortCommands == nil {
+		t := true
+		c.Commands.SessionOnlyShortCommands = &t
+	}
 	fill(&c.Commands.FavoriteAddKeywords, DefaultCommands.FavoriteAddKeywords)
 	fill(&c.Commands.FavoriteRemoveKeywords, DefaultCommands.FavoriteRemoveKeywords)
 	fill(&c.Commands.PlayFavoritesKeywords, DefaultCommands.PlayFavoritesKeywords)

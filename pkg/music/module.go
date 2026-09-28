@@ -398,26 +398,15 @@ func (m *Module) classifyInstruction(text, normalized string) func() {
 		}
 	}
 
+	if job := m.classifyShortCommand(normalized); job != nil {
+		return job
+	}
+
 	switch {
-	case m.matchExact(normalized, m.config.Commands.PauseKeywords):
-		return func() {
-			log.Printf("🎯 [music] 命中 pause_keywords")
-			m.handlePause()
-		}
 	case m.matchExact(normalized, m.config.Commands.ResumeKeywords):
 		return func() {
 			log.Printf("🎯 [music] 命中 resume_keywords")
 			m.handleResume()
-		}
-	case m.matchExact(normalized, m.config.Commands.FavoriteRemoveKeywords):
-		return func() {
-			log.Printf("🎯 [music] 命中 favorite_remove_keywords")
-			m.handleFavorite(false)
-		}
-	case m.matchExact(normalized, m.config.Commands.FavoriteAddKeywords):
-		return func() {
-			log.Printf("🎯 [music] 命中 favorite_add_keywords")
-			m.handleFavorite(true)
 		}
 	case m.matchExact(normalized, m.config.Commands.PlayFavoritesKeywords):
 		return func() {
@@ -431,16 +420,6 @@ func (m *Module) classifyInstruction(text, normalized string) func() {
 			m.player.ClearQueue()
 			_ = m.player.Stop()
 			m.player.Speak("好的，已停止")
-		}
-	case m.matchExact(normalized, m.config.Commands.NextKeywords):
-		return func() {
-			log.Printf("🎯 [music] 命中 next_keywords")
-			m.handleNext()
-		}
-	case m.matchExact(normalized, m.config.Commands.PreviousKeywords):
-		return func() {
-			log.Printf("🎯 [music] 命中 previous_keywords")
-			m.handlePrevious()
 		}
 	case m.matchExact(normalized, m.config.Commands.RepeatOneKeywords):
 		return func() {

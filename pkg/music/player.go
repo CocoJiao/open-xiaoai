@@ -460,6 +460,13 @@ func (p *Player) markResumedLocked(now time.Time) {
 	p.state = StatePlaying
 }
 
+// HasSession 是否存在活跃的音乐会话：有当前曲（播放中、暂停中，或被物理键停住但队列还在）。
+func (p *Player) HasSession() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.currentSong != nil
+}
+
 // IsPaused 是否处于用户暂停状态。
 func (p *Player) IsPaused() bool {
 	p.mu.Lock()

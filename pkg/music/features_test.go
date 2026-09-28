@@ -360,3 +360,40 @@ func TestModuleArtistPlayPrefersLocal(t *testing.T) {
 		t.Fatalf("played=%v resolved=%v", *played, lx.resolved)
 	}
 }
+
+func TestShortCommandsOnlyDuringSession(t *testing.T) {
+	m, dir, _, _ := newFeatureModule(t)
+	for _, w := range []string{"继续", "暂停", "下一首", "上一首", "收藏", "取消收藏"} {
+		if job := m.classifyInstruction(w, w); job != nil {
+			t.Errorf("%q should fall through without session", w)
+		}
+	}
+	// 明确的长口令不受限制
+	for _, w := range []string{"继续播放", "播放收藏", "停止"} {
+		if job := m.classifyInstruction(w, w); job == nil {
+			t.Errorf("%q should always be handled", w)
+		}
+	}
+	a := filepath.Join(dir, "a.mp3")
+	_ = os.WriteFile(a, []byte("x"), 0644)
+	m.player.SetQueue(m.player.BuildQueueFromSongs([]IndexedSong{{Path: a}}, ""))
+	for _, w := range []string{"继续", "暂停", "下一首", "收藏"} {
+		if job := m.classifyInstruction(w, w); job == nil {
+			t.Errorf("%q should be handled during session", w)
+		}
+	}
+	// 暂停中也算会话
+	m.classifyInstruction("暂停", "暂停")()
+	if job := m.classifyInstruction("继续", "继续"); job == nil {
+		t.Fatal("继续 should work while paused")
+	}
+}
+
+func TestShortCommandsGateCanBeDisabled(t *testing.T) {
+	m, _, _, _ := newFeatureModule(t)
+	f := false
+	m.config.Commands.SessionOnlyShortCommands = &f
+	if job := m.classifyInstruction("下一首", "下一首"); job == nil {
+		t.Fatal("gate disabled: 下一首 should be handled")
+	}
+}
