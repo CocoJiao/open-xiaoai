@@ -810,11 +810,27 @@ func (m *Module) handleLXPlay(keyword string) bool {
 		return false
 	}
 
-	m.maybeAbortXiaoAI()
 	name := track.Name
 	if name == "" {
 		name = keyword
 	}
+	// lx.download=true：先下载到本地再播放本地文件；下载失败退回在线直链。
+	if m.config.LX.Download {
+		if item, ok := m.downloadLXTrack(ctx, track, name); ok {
+			item.Title = name
+			item.Singer = track.Singer
+			if song, found := m.indexer.SongByPath(item.Path); found {
+				item.Size, item.DurationMs = song.Size, song.DurationMs
+			}
+			m.maybeAbortXiaoAI()
+			_ = m.player.Speak(fmt.Sprintf("好的，已下载并播放%s", name))
+			m.player.SetExhaustedHandler(nil)
+			m.player.SetQueue([]SongItem{item})
+			return true
+		}
+		log.Printf("⚠️ [music/lx] 下载失败，改为在线播放: %s", name)
+	}
+	m.maybeAbortXiaoAI()
 	_ = m.player.Speak(fmt.Sprintf("好的，当前播放的是在线歌曲%s", name))
 	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue([]SongItem{{

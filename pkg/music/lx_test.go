@@ -69,8 +69,8 @@ func TestLXClientResolveSearchesAndFetchesURL(t *testing.T) {
 		Enabled:      true,
 		BaseURL:      srv.URL,
 		FrontendAuth: "xinxin",
-		Source:       "kw",
-		Quality:      "128k",
+		Source:       StringList{"kw"},
+		Quality:      StringList{"128k"},
 		TimeoutSec:   1,
 	})
 
@@ -132,8 +132,8 @@ func TestLXClientResolveLogsInWithUsernamePassword(t *testing.T) {
 		BaseURL:    srv.URL,
 		Username:   "alice",
 		Password:   "secret",
-		Source:     "kw",
-		Quality:    "128k",
+		Source:     StringList{"kw"},
+		Quality:    StringList{"128k"},
 		TimeoutSec: 1,
 	})
 
@@ -178,8 +178,8 @@ func TestLXClientResolveLogsRemoteURLWithoutPassword(t *testing.T) {
 		BaseURL:    srv.URL,
 		Username:   "alice",
 		Password:   "secret",
-		Source:     "kw",
-		Quality:    "128k",
+		Source:     StringList{"kw"},
+		Quality:    StringList{"128k"},
 		TimeoutSec: 1,
 	})
 
@@ -245,8 +245,8 @@ func TestLXClientDownloadWritesProxyResponseToFile(t *testing.T) {
 	client := NewLXClient(&LXConfig{
 		Enabled:    true,
 		BaseURL:    srv.URL,
-		Source:     "kw",
-		Quality:    "128k",
+		Source:     StringList{"kw"},
+		Quality:    StringList{"128k"},
 		TimeoutSec: 1,
 	})
 	track := &LXTrack{

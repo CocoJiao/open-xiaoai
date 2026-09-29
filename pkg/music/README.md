@@ -91,10 +91,11 @@ music:
     username: ""                 # 可选：普通用户名；未配置 user_token 时自动登录获取 token
     password: ""                 # 可选：普通用户密码；日志不会打印此值
     frontend_auth: ""            # 可选：admin 管理口令；不建议日常播放依赖
-     download: false              # 已废弃为自动下载开关；普通播放始终在线播放
+     download: false              # true: 普通播放本地没有的歌时先下载再播（失败退回在线）；false: 在线直接播
     download_dir: ""             # 下载目录；空则使用 music.dirs[0]
-    source: "kw"                 # kw / tx / wy / kg / mg
-    quality: "128k"              # 128k / 320k / flac，取决于源和歌曲
+    source: "kw"                 # kw / tx / wy / kg / mg；可写多个："wy,kw" 或 [wy, kw]
+                                 # 多个时并发搜索所有平台、合并打分；同样匹配的歌按这里的顺序优先
+    quality: "128k"              # 128k / 320k / flac；可写多个："320k,128k"，按顺序尝试，取不到就降级
     timeout_sec: 10
 
   # 播放器行为（可选）
@@ -486,7 +487,7 @@ music:
     enabled: true
     embedded: true
     embedded_js_dir: "../lx-go/js"   # 指向音源脚本（可以多个）目录，相对/绝对路径都行
-    download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # true 时普通播放也先下载再播；false 只在说“下载歌曲”时保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "wy"
     quality: "128k"
@@ -507,7 +508,7 @@ music:
   lx:
     enabled: true
     base_url: "http://127.0.0.1:8080"   # pkg/lx-go 默认端口，和 music 自己的文件服务端口 18080 不冲突
-    download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # true 时普通播放也先下载再播；false 只在说“下载歌曲”时保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "wy"
     quality: "128k"
@@ -535,7 +536,7 @@ music:
     base_url: "http://localhost:9527"
     username: "your_lx_user"
     password: "your_lx_password"
-    download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # true 时普通播放也先下载再播；false 只在说“下载歌曲”时保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "kw"
     quality: "128k"
@@ -553,7 +554,7 @@ music:
 
 运行时会打印 LX 搜索请求、搜索返回摘要、取直链请求、取直链返回摘要以及最终远程播放 URL；日志会隐藏登录 token，也不会打印密码。
 
-说“下载稻香”或“下载周杰伦的稻香”时，在线歌曲会通过 LX 的 `/api/music/download` 代理下载到本地，默认保存为 `歌名 - 歌手.mp3`，下载成功后自动播放。如果文件已存在会直接复用并播放本地文件，下载后会刷新曲库索引，后续本地搜索可以直接命中。普通“播放”只播放在线歌曲，不会自动下载。
+说“下载稻香”或“下载周杰伦的稻香”时，在线歌曲会通过 LX 的 `/api/music/download` 代理下载到本地，默认保存为 `歌名 - 歌手.mp3`，下载成功后自动播放。如果文件已存在会直接复用并播放本地文件，下载后会刷新曲库索引，后续本地搜索可以直接命中。普通“播放”默认在线直接播；设置 `lx.download: true` 后会先下载到本地再播放，下载失败时退回在线直链。
 
 #### 本地优先与远程触发规则
 

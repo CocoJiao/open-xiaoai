@@ -1,5 +1,7 @@
 package music
 
+import "strings"
+
 // MusicConfig 音乐模块配置
 type MusicConfig struct {
 	Enabled    bool           `yaml:"enabled"`
@@ -117,11 +119,15 @@ type LXConfig struct {
 	UserToken    string `yaml:"user_token"`
 	Username     string `yaml:"username"`
 	Password     string `yaml:"password"`
-	Download     bool   `yaml:"download"`
+	Download     bool   `yaml:"download"` // true: 普通播放的在线歌曲先下载到本地再播（失败退回在线）
 	DownloadDir  string `yaml:"download_dir"`
-	Source       string `yaml:"source"`
-	Quality      string `yaml:"quality"`
-	TimeoutSec   int    `yaml:"timeout_sec"`
+	// Source 在线搜索的平台，可写单个（"kw"）、逗号分隔（"wy,kw"）或列表（[wy, kw]）。
+	// 多个时会同时搜索所有平台，合并结果打分；同样匹配的歌按这里的顺序优先。
+	Source StringList `yaml:"source"`
+	// Quality 音质，同样支持单个或多个（"320k,128k"）。取直链时按顺序尝试，
+	// 前一个音质取不到再退到下一个。
+	Quality    StringList `yaml:"quality"`
+	TimeoutSec int        `yaml:"timeout_sec"`
 
 	// Embedded 为 true 时，不走 base_url 请求外部/独立起的 LX Sync Server，
 	// 而是直接在本进程内加载 pkg/lx-go 引擎（不需要手动另起一个进程/端口）。
@@ -238,11 +244,11 @@ func (c *MusicConfig) ApplyDefaults() {
 	if c.History.FavoritesFile == "" {
 		c.History.FavoritesFile = "cache/favorites.json"
 	}
-	if c.LX.Source == "" {
-		c.LX.Source = "kw"
+	if len(c.LX.Source) == 0 {
+		c.LX.Source = StringList{"kw"}
 	}
-	if c.LX.Quality == "" {
-		c.LX.Quality = "128k"
+	if len(c.LX.Quality) == 0 {
+		c.LX.Quality = StringList{"128k"}
 	}
 	if c.LX.TimeoutSec <= 0 {
 		c.LX.TimeoutSec = 10
@@ -339,4 +345,49 @@ func (c *MusicConfig) ApplyDefaults() {
 			c.Stories[i].EpisodePattern = DefaultEpisodePattern
 		}
 	}
+}
+
+// StringList 兼容三种 YAML 写法的字符串列表："kw"、"wy,kw"、[wy, kw]。
+type StringList []string
+
+// UnmarshalYAML 使用 yaml.v2/v3 都支持的旧式接口，避免 pkg/music 直接依赖 yaml 库。
+func (l *StringList) UnmarshalYAML(unmarshal func(any) error) error {
+	var list []string
+	if err := unmarshal(&list); err == nil {
+		*l = cleanStringList(list)
+		return nil
+	}
+	var single string
+	if err := unmarshal(&single); err != nil {
+		return err
+	}
+	*l = cleanStringList(strings.FieldsFunc(single, func(r rune) bool {
+		return r == ',' || r == '，' || r == ' ' || r == '/' || r == '|'
+	}))
+	return nil
+}
+
+// String 日志用。
+func (l StringList) String() string { return strings.Join(l, ",") }
+
+// First 第一个值，空列表返回 ""。
+func (l StringList) First() string {
+	if len(l) == 0 {
+		return ""
+	}
+	return l[0]
+}
+
+func cleanStringList(in []string) StringList {
+	out := make(StringList, 0, len(in))
+	seen := map[string]bool{}
+	for _, v := range in {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }

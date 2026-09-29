@@ -78,15 +78,12 @@ func (c *LXClient) Resolve(ctx context.Context, keyword string) (*LXTrack, error
 		return nil, err
 	}
 
-	songs, err := c.search(ctx, keyword)
+	groups, err := searchLXPlatforms(ctx, c.cfg.Source, keyword, c.searchPlatform)
 	if err != nil {
 		return nil, err
 	}
-	if len(songs) == 0 {
-		return nil, fmt.Errorf("lx no result for %q", keyword)
-	}
-	return resolveRanked(keyword, songs, func(s lxSongInfo) (*LXTrack, error) {
-		return c.fetchURL(ctx, s)
+	return resolveOrdered(rankLXGroups(keyword, groups), func(s lxSongInfo) (*LXTrack, error) {
+		return c.fetchURLAnyQuality(ctx, s)
 	})
 }
 
@@ -105,16 +102,20 @@ type lxArtistSearcher interface {
 	ResolveCandidate(ctx context.Context, c LXCandidate) (*LXTrack, error)
 }
 
-// resolveRanked 对搜索结果重新打分，按分数依次尝试取直链（最多 lxResolveMaxAttempts 个）。
+// resolveRanked 单一平台结果：重新打分后依次尝试取直链。
 func resolveRanked(keyword string, songs []lxSongInfo, fetch func(lxSongInfo) (*LXTrack, error)) (*LXTrack, error) {
-	ranked := rankLXSongs(keyword, songs)
+	return resolveOrdered(rankLXSongs(keyword, songs), fetch)
+}
+
+// resolveOrdered 按给定顺序依次尝试取直链（最多 lxResolveMaxAttempts 个）。
+func resolveOrdered(ranked []lxSongInfo, fetch func(lxSongInfo) (*LXTrack, error)) (*LXTrack, error) {
 	var lastErr error
 	for i, s := range ranked {
 		if i >= lxResolveMaxAttempts {
 			break
 		}
-		log.Printf("🌐 [music/lx] 候选#%d: name=%q singer=%q (原始排名=%d)", i+1,
-			stringField(s, "name"), stringField(s, "singer"), indexOfSong(songs, s))
+		log.Printf("🌐 [music/lx] 候选#%d: [%s] name=%q singer=%q", i+1,
+			stringField(s, "source"), stringField(s, "name"), stringField(s, "singer"))
 		track, err := fetch(s)
 		if err == nil && track != nil && track.URL != "" {
 			return track, nil
@@ -125,16 +126,10 @@ func resolveRanked(keyword string, songs []lxSongInfo, fetch func(lxSongInfo) (*
 		log.Printf("⚠️ [music/lx] 候选#%d 取直链失败，尝试下一个: %v", i+1, err)
 		lastErr = err
 	}
-	return nil, lastErr
-}
-
-func indexOfSong(songs []lxSongInfo, target lxSongInfo) int {
-	for i, s := range songs {
-		if fmt.Sprintf("%p", s) == fmt.Sprintf("%p", target) {
-			return i
-		}
+	if lastErr == nil {
+		lastErr = errors.New("no candidate")
 	}
-	return -1
+	return nil, lastErr
 }
 
 func candidatesFromSongs(songs []lxSongInfo) []LXCandidate {
@@ -150,11 +145,11 @@ func (c *LXClient) SearchArtistSongs(ctx context.Context, artist string, limit i
 	if err := c.ensureUserToken(ctx); err != nil {
 		return nil, err
 	}
-	songs, err := c.search(ctx, artist)
+	groups, err := searchLXPlatforms(ctx, c.cfg.Source, artist, c.searchPlatform)
 	if err != nil {
 		return nil, err
 	}
-	return candidatesFromSongs(filterLXSongsBySinger(artist, songs, limit)), nil
+	return candidatesFromSongs(filterLXSongsBySinger(artist, flattenLXGroups(groups), limit)), nil
 }
 
 // ResolveCandidate 实现 lxArtistSearcher。
@@ -162,10 +157,16 @@ func (c *LXClient) ResolveCandidate(ctx context.Context, cand LXCandidate) (*LXT
 	if err := c.ensureUserToken(ctx); err != nil {
 		return nil, err
 	}
-	return c.fetchURL(ctx, cand.info)
+	return c.fetchURLAnyQuality(ctx, cand.info)
 }
 
-func (c *LXClient) search(ctx context.Context, keyword string) ([]lxSongInfo, error) {
+func (c *LXClient) fetchURLAnyQuality(ctx context.Context, song lxSongInfo) (*LXTrack, error) {
+	return resolveWithQualities(c.cfg.Quality, func(q string) (*LXTrack, error) {
+		return c.fetchURL(ctx, song, q)
+	})
+}
+
+func (c *LXClient) searchPlatform(ctx context.Context, platform, keyword string) ([]lxSongInfo, error) {
 	base := strings.TrimRight(c.cfg.BaseURL, "/")
 	endpoint, err := url.Parse(base + "/api/music/search")
 	if err != nil {
@@ -173,12 +174,12 @@ func (c *LXClient) search(ctx context.Context, keyword string) ([]lxSongInfo, er
 	}
 	q := endpoint.Query()
 	q.Set("name", keyword)
-	q.Set("source", c.cfg.Source)
+	q.Set("source", platform)
 	q.Set("type", "song")
 	q.Set("page", "1")
 	q.Set("pages", "1")
 	endpoint.RawQuery = q.Encode()
-	log.Printf("🌐 [music/lx] search request: name=%q source=%s url=%s", keyword, c.cfg.Source, endpoint.String())
+	log.Printf("🌐 [music/lx] search request: name=%q source=%s url=%s", keyword, platform, endpoint.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
 	if err != nil {
@@ -205,16 +206,16 @@ func (c *LXClient) search(ctx context.Context, keyword string) ([]lxSongInfo, er
 	return nil, errors.New("lx search response is not a song list")
 }
 
-func (c *LXClient) fetchURL(ctx context.Context, song lxSongInfo) (*LXTrack, error) {
+func (c *LXClient) fetchURL(ctx context.Context, song lxSongInfo, quality string) (*LXTrack, error) {
 	base := strings.TrimRight(c.cfg.BaseURL, "/")
 	body, err := json.Marshal(map[string]any{
 		"songInfo": song,
-		"quality":  c.cfg.Quality,
+		"quality":  quality,
 	})
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("🌐 [music/lx] url request: song=%s quality=%s endpoint=%s", briefJSON(song), c.cfg.Quality, base+"/api/music/url")
+	log.Printf("🌐 [music/lx] url request: song=%s quality=%s endpoint=%s", briefJSON(song), quality, base+"/api/music/url")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/music/url", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -246,7 +247,7 @@ func (c *LXClient) fetchURL(ctx context.Context, song lxSongInfo) (*LXTrack, err
 		Name:    stringField(song, "name"),
 		Singer:  stringField(song, "singer"),
 		Source:  stringField(song, "source"),
-		Quality: out.Type,
+		Quality: firstNonEmptyStr(out.Type, quality),
 		URL:     out.URL,
 	}, nil
 }
@@ -414,4 +415,22 @@ func briefJSON(v any) string {
 		return string(data[:max]) + "...<truncated>"
 	}
 	return string(data)
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// flattenLXGroups 按平台优先级拼接多平台结果（"XX的歌"去重时保留优先平台的版本）。
+func flattenLXGroups(groups [][]lxSongInfo) []lxSongInfo {
+	out := make([]lxSongInfo, 0)
+	for _, g := range groups {
+		out = append(out, g...)
+	}
+	return out
 }
