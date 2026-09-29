@@ -155,12 +155,15 @@ func LoadSources(dir string) (*Registry, error) {
 
 	reg := &Registry{}
 	seen := make(map[string]string) // name -> 已加载的文件名，用于检测冲突
+	report := &loadReport{dir: dir}
+	defer report.print()
 
 	for _, file := range files {
 		full := filepath.Join(dir, file)
 		raw, err := os.ReadFile(full)
 		if err != nil {
 			log.Printf("⚠️  [lx-go] 读取音源文件失败，已跳过: %s (%v)", file, err)
+			report.add(file, file, loadFailed, fmt.Sprintf("读取失败: %v", err))
 			continue
 		}
 
@@ -172,12 +175,14 @@ func LoadSources(dir string) (*Registry, error) {
 
 		if existing, dup := seen[name]; dup {
 			log.Printf("⚠️  [lx-go] 音源名称冲突: %s (文件: %s) 与已加载的 %s 同名，已跳过，只使用先加载的那个", name, file, existing)
+			report.add(file, name, loadDuplicate, "与 "+existing+" 同名，未使用")
 			continue
 		}
 
 		engine, err := NewEngine(name, string(raw))
 		if err != nil {
 			log.Printf("❌ [lx-go] 音源加载失败，已跳过: %s (文件: %s) 错误: %v", name, file, err)
+			report.add(file, name, loadFailed, fmt.Sprintf("脚本加载失败: %v", err))
 			continue
 		}
 
@@ -185,6 +190,7 @@ func LoadSources(dir string) (*Registry, error) {
 		if ok, info := selfTestSource(engine); !ok {
 			log.Printf("❌ [lx-go] %s，未加入音源列表: %s (文件: %s)，请检查该脚本或其上游接口是否可用", info, name, file)
 			engine.Close()
+			report.add(file, name, loadFailed, info)
 			continue
 		} else {
 			log.Printf("✅ [lx-go] %s: %s", name, info)
@@ -192,6 +198,11 @@ func LoadSources(dir string) (*Registry, error) {
 
 		seen[name] = file
 		reg.Sources = append(reg.Sources, &Source{Name: name, File: file, Engine: engine})
+		status := loadOK
+		if len(engine.Sources()) == 0 {
+			status = loadUntested
+		}
+		report.add(file, name, status, summarizeSources(engine.Sources()))
 		log.Printf("✅ [lx-go] 已加载音源: %s (文件: %s)，支持平台: %s", name, file, summarizeSources(engine.Sources()))
 	}
 
@@ -341,6 +352,23 @@ func (r *Registry) ResolveURL(ctx context.Context, platform string, songInfo map
 }
 
 func toSongList(result any) ([]map[string]any, error) {
+	// 部分脚本返回 {list:[...]} / {data:[...]} / {data:{list:[...]}} 这类包装对象
+	for depth := 0; depth < 2; depth++ {
+		obj, isMap := result.(map[string]interface{})
+		if !isMap {
+			break
+		}
+		found := false
+		for _, k := range []string{"list", "data", "songs", "result"} {
+			if v, ok := obj[k]; ok && v != nil {
+				result, found = v, true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+	}
 	arr, ok := result.([]interface{})
 	if !ok {
 		return nil, fmt.Errorf("unexpected search result shape: %T", result)
