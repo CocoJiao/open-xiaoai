@@ -124,11 +124,12 @@ func (e *EmbeddedLX) resolveSong(ctx context.Context, song lxSongInfo) (*LXTrack
 		}
 		log.Printf("🌐 [music/lx-embedded] url response: 音源=%s quality=%s url=%s", urlSourceName, q, remoteURL)
 		return &LXTrack{
-			Name:    stringField(song, "name"),
-			Singer:  stringField(song, "singer"),
-			Source:  platform,
-			Quality: q,
-			URL:     remoteURL,
+			Name:       stringField(song, "name"),
+			Singer:     stringField(song, "singer"),
+			Source:     platform,
+			Quality:    q,
+			URL:        remoteURL,
+			DurationMs: parseIntervalMs(stringField(song, "interval")),
 		}, nil
 	})
 }

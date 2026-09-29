@@ -170,6 +170,15 @@ func (m *Module) Start(ctx context.Context) error {
 		m.player.WatchdogLoop(m.ctx)
 	}()
 
+	// 设备状态轮询：电平触发驱动切歌，见 device_poll.go
+	if pollSec := *m.config.Player.StatusPollSec; pollSec > 0 {
+		m.refreshWg.Add(1)
+		go func() {
+			defer m.refreshWg.Done()
+			m.player.DeviceStatusLoop(m.ctx, time.Duration(pollSec)*time.Second)
+		}()
+	}
+
 	// 播放期间周期性 AbortXiaoAI：防止小爱云端在后台重新连接后把"之前暂停的故事/新闻"
 	// resume 到 mediaplayer，抢占我们本地队列。只在 abort_xiaoai_on_play 开启且间隔>0 时启动。
 	abortOnPlay := m.config.Commands.AbortXiaoAIOnPlay != nil && *m.config.Commands.AbortXiaoAIOnPlay
@@ -822,6 +831,9 @@ func (m *Module) handleLXPlay(keyword string) bool {
 			if song, found := m.indexer.SongByPath(item.Path); found {
 				item.Size, item.DurationMs = song.Size, song.DurationMs
 			}
+			if item.DurationMs == 0 {
+				item.DurationMs = track.DurationMs
+			}
 			m.maybeAbortXiaoAI()
 			_ = m.player.Speak(fmt.Sprintf("好的，已下载并播放%s", name))
 			m.player.SetExhaustedHandler(nil)
@@ -834,10 +846,11 @@ func (m *Module) handleLXPlay(keyword string) bool {
 	_ = m.player.Speak(fmt.Sprintf("好的，当前播放的是在线歌曲%s", name))
 	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue([]SongItem{{
-		Path:   fmt.Sprintf("lx:%s-%s", track.Singer, name),
-		URL:    track.URL,
-		Title:  name,
-		Singer: track.Singer,
+		Path:       fmt.Sprintf("lx:%s-%s", track.Singer, name),
+		URL:        track.URL,
+		Title:      name,
+		Singer:     track.Singer,
+		DurationMs: track.DurationMs,
 	}})
 	return true
 }

@@ -24,6 +24,8 @@ type LXTrack struct {
 	Source  string
 	Quality string
 	URL     string
+	// DurationMs 来自搜索结果的 interval，设备不报进度时用于估算播完时间；0 未知。
+	DurationMs int64
 }
 
 type lxSongInfo map[string]any
@@ -90,9 +92,10 @@ func (c *LXClient) Resolve(ctx context.Context, keyword string) (*LXTrack, error
 // LXCandidate 在线搜索结果（尚未取直链）。直链有时效，"XX的歌"一次入队多首时
 // 先只保存候选，播到那一首时再取直链。
 type LXCandidate struct {
-	Name   string
-	Singer string
-	info   lxSongInfo
+	Name       string
+	Singer     string
+	DurationMs int64
+	info       lxSongInfo
 }
 
 // lxArtistSearcher 可选能力："XX的歌"按歌手搜多首 + 延迟取直链。
@@ -135,7 +138,8 @@ func resolveOrdered(ranked []lxSongInfo, fetch func(lxSongInfo) (*LXTrack, error
 func candidatesFromSongs(songs []lxSongInfo) []LXCandidate {
 	out := make([]LXCandidate, len(songs))
 	for i, s := range songs {
-		out[i] = LXCandidate{Name: stringField(s, "name"), Singer: stringField(s, "singer"), info: s}
+		out[i] = LXCandidate{Name: stringField(s, "name"), Singer: stringField(s, "singer"),
+			DurationMs: parseIntervalMs(stringField(s, "interval")), info: s}
 	}
 	return out
 }
@@ -244,11 +248,12 @@ func (c *LXClient) fetchURL(ctx context.Context, song lxSongInfo, quality string
 	log.Printf("🌐 [music/lx] remote url: %s", out.URL)
 
 	return &LXTrack{
-		Name:    stringField(song, "name"),
-		Singer:  stringField(song, "singer"),
-		Source:  stringField(song, "source"),
-		Quality: firstNonEmptyStr(out.Type, quality),
-		URL:     out.URL,
+		Name:       stringField(song, "name"),
+		Singer:     stringField(song, "singer"),
+		Source:     stringField(song, "source"),
+		Quality:    firstNonEmptyStr(out.Type, quality),
+		DurationMs: parseIntervalMs(stringField(song, "interval")),
+		URL:        out.URL,
 	}, nil
 }
 

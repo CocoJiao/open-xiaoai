@@ -184,6 +184,11 @@ type PlayerConfig struct {
 	// 默认开启（true）：方便小朋友知道当前进度、中断后能知道听到第几集。
 	// 设为 false 可关闭这段播报，直接播放音频内容。
 	AnnounceEpisodeBeforePlay *bool `yaml:"announce_episode_before_play,omitempty"`
+
+	// StatusPollSec 服务端主动轮询设备播放状态（player_get_play_status）的间隔，默认 1 秒，0 关闭。
+	// 用设备报告的位置/时长驱动切歌：快播完提前切、设备空闲切、内容被设备续播接管时抢回。
+	// 不再只依赖客户端的状态变化事件（边沿触发，歌曲结束瞬间被设备续播接上时会漏掉）。
+	StatusPollSec *int `yaml:"status_poll_sec,omitempty"`
 }
 
 // DefaultExtensions 默认支持的音频扩展名
@@ -335,6 +340,10 @@ func (c *MusicConfig) ApplyDefaults() {
 	if c.Player.DiagnosticIntervalSec == nil {
 		d := 0
 		c.Player.DiagnosticIntervalSec = &d
+	}
+	if c.Player.StatusPollSec == nil {
+		d := 1
+		c.Player.StatusPollSec = &d
 	}
 	if c.Player.AnnounceEpisodeBeforePlay == nil {
 		t := true

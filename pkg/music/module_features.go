@@ -271,9 +271,10 @@ func (m *Module) handleArtistPlay(artist string) bool {
 			for _, c := range cands {
 				c := c
 				items = append(items, SongItem{
-					Path:   fmt.Sprintf("lx:%s-%s", c.Singer, c.Name),
-					Title:  c.Name,
-					Singer: c.Singer,
+					Path:       fmt.Sprintf("lx:%s-%s", c.Singer, c.Name),
+					Title:      c.Name,
+					Singer:     c.Singer,
+					DurationMs: c.DurationMs,
 					Resolve: func() (string, error) {
 						track, err := searcher.ResolveCandidate(m.context(), c)
 						if err != nil {

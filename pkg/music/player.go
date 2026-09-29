@@ -227,6 +227,11 @@ type Player struct {
 	// seek 可覆盖的跳进度入口（测试用）
 	seek func(positionMs int64) error
 
+	// 设备状态轮询（device_poll.go）
+	queryStatus func() (deviceStatus, error) // 测试用覆盖
+	pollIdle    int                          // 连续 Idle 次数
+	deviceDurMs int64                        // 设备报告的当前曲时长（换歌时清零）
+
 	// initialStateCh 在收到第一个 playing 事件时关闭，用来给上层"等一下首个状态"的能力，
 	// 取代之前注释里建议的 Sleep 推断（不可靠）。
 	initialStateCh   chan struct{}
@@ -824,6 +829,8 @@ func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) boo
 	}
 	p.currentSong = &item
 	p.pausedAt = time.Time{}
+	p.pollIdle = 0
+	p.deviceDurMs = 0
 	p.currentOffset = time.Duration(item.StartOffsetMs) * time.Millisecond
 	// 主动设 Playing：
 	// 1) 切歌时 PlayingMonitor 可能不会再上报"Playing"（如果之前已经是 Playing 且 mute_stat 没变化）。
