@@ -3,9 +3,12 @@ package music
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -369,7 +372,7 @@ func (p *Player) PlayURL(url string) error {
 		log.Printf("🌐 [music/player] PlayURL (override): %s", url)
 		return p.playURL(url)
 	}
-	log.Printf("🌐 [music/player] PlayURL → 设备: %s", url)
+	log.Printf("🌐 [music/player] PlayURL → 设备: %s", shortURL(url))
 	script := fmt.Sprintf(
 		`ubus -t 2 call mediaplayer player_reset >/dev/null 2>&1 ; `+
 			`ubus -t 2 call mediaplayer player_play_operation '{"action":"play","media":"common"}' >/dev/null 2>&1 ; `+
@@ -386,7 +389,11 @@ func (p *Player) PlayURL(url string) error {
 	}
 	r := decodeShellResult(resp)
 	// stdout 一般是最后 player_play_url 的输出 {"code": 0}；其他几步 >/dev/null 抑制了。
-	log.Printf("🌐 [music/player] PlayURL ubus 返回: %s", briefShellResult(r))
+	if r != nil && r.ExitCode == 0 {
+		// 成功时不再单独打一行（"正在播放"会紧跟着出现）
+	} else {
+		log.Printf("🌐 [music/player] PlayURL ubus 返回: %s", briefShellResult(r))
+	}
 	// 设备端非零退出意味着 mediaplayer 没真正接管播放。必须上抛错误，否则
 	// playItemLocked 会把 state 标成 Playing 但实际没声音，PlayingMonitor 永远不会
 	// 上报 Playing→Idle 跃迁，整个队列就此卡死。
@@ -564,22 +571,43 @@ func summarizeShellText(s string) string {
 	return s
 }
 
-// treatSpeakExitAsSuccess 判断 tts_play.sh 的非零退出是否可视为“已实际播报成功”。
-// 某些机型上会出现 "my_log: not found" + exit=1，但实际已经把 TTS 播放完。
-func treatSpeakExitAsSuccess(stdout, stderr string, elapsed time.Duration) bool {
-	if elapsed < time.Second {
-		// 不到 1 秒就返回，TTS 根本没机会播，按真失败处理
-		return false
+// speakOutcome 解析 tts_play.sh 的执行结果。
+//
+// 为什么不能看 exit code：固件自带的 /usr/sbin/tts_play.sh 到处调用 my_log，但这个函数在
+// 脚本里没有定义（stderr 里的 "line 1: my_log: not found"），导致脚本退出码不可信——
+// 实际已经合成并播完，照样返回 exit=1。stderr 里还混着 libmiplayerlite 的调试输出。
+//
+// 可靠的判据是 stdout：合成成功时 mibrain 会打印 /tmp/tts/tts_xxx.mp3 路径，脚本随后播放它。
+// 典型失败是 AbortXiaoAI 刚重启 mico_aivs_lab、mibrain 还没起来：
+// "Failed to parse message data" + "miplayer: option requires an argument -- 'f'"（没拿到音频路径）。
+func speakOutcome(stdout, stderr string, exitCode int, elapsed time.Duration) (ok bool, reason string) {
+	played := strings.Contains(stdout, "/tmp/tts/tts_") || strings.Contains(stderr, "event(EndReached) is posted")
+	if played && elapsed >= time.Second {
+		return true, ""
 	}
-	// 主要判据：stdout 有 TTS 文件路径，说明语音合成成功且已播放
-	if strings.Contains(stdout, "/tmp/tts/tts_") {
-		return true
+	if played {
+		// 合成了但不到 1 秒就返回：音频没来得及播出来
+		return false, "合成成功但未播放完"
 	}
-	// 次要判据：libmiplayerlite 播放完成事件
-	if strings.Contains(stderr, "event(EndReached) is posted") {
-		return true
+	if strings.Contains(stderr, "Failed to parse message data") || strings.Contains(stderr, "option requires an argument") {
+		return false, "语音合成服务未就绪（小爱服务刚重启）"
 	}
-	return false
+	if exitCode == 0 {
+		return true, ""
+	}
+	return false, firstMeaningfulLine(stderr)
+}
+
+// firstMeaningfulLine 从 stderr 里挑第一行有用的信息（跳过 my_log 和 libmiplayerlite 噪音）。
+func firstMeaningfulLine(stderr string) string {
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.Contains(line, "my_log: not found") || strings.HasPrefix(line, "libmiplayerlite") {
+			continue
+		}
+		return summarizeShellText(line)
+	}
+	return "未知错误"
 }
 
 // Speak 播报反馈语
@@ -602,7 +630,6 @@ func (p *Player) Speak(text string) error {
 	if p.speak != nil {
 		return p.speak(text)
 	}
-	log.Printf("📝 [music/player] Speak: %q", text)
 	p.extendSuppress(speakSuppressPrefix)
 
 	script := fmt.Sprintf(`/usr/sbin/tts_play.sh '%s'`, shellEscapeSingle(text))
@@ -613,31 +640,28 @@ func (p *Player) Speak(text string) error {
 		resp, err := connect.GetRPC().CallRemote("run_shell", script, &timeout)
 		elapsed := time.Since(start)
 		if err != nil {
-			log.Printf("❌ [music/player] Speak RPC 失败: %v", err)
-			return elapsed, err
+			return elapsed, fmt.Errorf("RPC 失败: %w", err)
 		}
 		r := decodeShellResult(resp)
-		log.Printf("📝 [music/player] Speak ubus 返回: %s (耗时=%v)",
-			briefShellResult(r), elapsed.Round(time.Millisecond))
-		if r != nil && r.ExitCode != 0 {
-			stderr := strings.TrimSpace(r.Stderr)
-			if treatSpeakExitAsSuccess(r.Stdout, stderr, elapsed) {
-				log.Printf("⚠️ [music/player] Speak 返回非零但判定为已成功播报: exit=%d stderr=%q (耗时=%v)",
-					r.ExitCode, summarizeShellText(stderr), elapsed.Round(time.Millisecond))
-				return elapsed, nil
-			}
-			err = fmt.Errorf("tts_play.sh exit=%d stderr=%s", r.ExitCode, summarizeShellText(stderr))
-			log.Printf("❌ [music/player] Speak 设备端非零退出: exit=%d stderr=%q", r.ExitCode, summarizeShellText(stderr))
-			return elapsed, err
+		if r == nil {
+			return elapsed, nil
+		}
+		if ok, reason := speakOutcome(r.Stdout, r.Stderr, r.ExitCode, elapsed); !ok {
+			return elapsed, errors.New(reason)
 		}
 		return elapsed, nil
 	}
 
 	elapsed, err := runSpeakOnce()
 	if err != nil {
-		log.Printf("📝 [music/player] Speak 首次失败，%v 后重试一次", speakRetryDelay)
+		log.Printf("📝 [music/player] Speak %q 失败: %v，%v 后重试", text, err, speakRetryDelay)
 		time.Sleep(speakRetryDelay)
 		elapsed, err = runSpeakOnce()
+	}
+	if err != nil {
+		log.Printf("❌ [music/player] Speak %q 失败: %v", text, err)
+	} else {
+		log.Printf("📝 [music/player] Speak %q ✓ (%v)", text, elapsed.Round(100*time.Millisecond))
 	}
 
 	if err == nil && elapsed < minSpeakBlocking {
@@ -886,7 +910,7 @@ func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) boo
 		p.currentSong.StartOffsetMs = 0
 		p.currentSong.URL = playURL
 	}
-	log.Printf("🎵 [music/player] 正在播放: %s (剩余队列=%d 历史=%d)", item.Path, queueLen, histLen)
+	log.Printf("🎵 [music/player] 正在播放: %s (剩余队列=%d 历史=%d)", shortPath(item.Path), queueLen, histLen)
 	if p.onSongChange != nil {
 		cb := p.onSongChange
 		go cb(item)
@@ -1364,4 +1388,29 @@ func (p *Player) DiagnosticContextLoop(ctx context.Context, interval time.Durati
 			p.snapshotDeviceContext("periodic")
 		}
 	}
+}
+
+// shortURL 日志用：本地文件服务的 URL 形如 http://host:port/file/<十六进制路径>/<URL 编码文件名>，
+// 十六进制段很长又没有可读信息，只保留 host 和解码后的文件名；在线直链去掉 query 并截断。
+func shortURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return summarizeShellText(raw)
+	}
+	if strings.HasPrefix(u.Path, "/file/") {
+		return u.Host + "/file/…/" + path.Base(u.Path)
+	}
+	out := u.Host + u.Path
+	if r := []rune(out); len(r) > 80 {
+		out = string(r[:80]) + "…"
+	}
+	return out
+}
+
+// shortPath 日志用：只保留"上级目录/文件名"，完整路径在 debug 时再看。
+func shortPath(p string) string {
+	if strings.HasPrefix(p, "lx:") {
+		return p
+	}
+	return filepath.Join(filepath.Base(filepath.Dir(p)), filepath.Base(p))
 }

@@ -318,7 +318,13 @@ func runShell(req connect.Request) (connect.Response, error) {
 	if err := json.Unmarshal(*req.Payload, &script); err != nil {
 		return connect.Response{}, fmt.Errorf("parse script: %w", err)
 	}
-	log.Printf("🐚 run_shell: %s", script)
+	if n := connect.QuietCount(); connect.IsQuietScript(script) {
+		if n%50 == 1 {
+			log.Printf("🐚 run_shell(例行状态查询，已执行 %d 次，只每 50 次记一行): %s", n, script)
+		}
+	} else {
+		log.Printf("🐚 run_shell: %s", script)
+	}
 
 	var res *utils.CommandResult
 	var err error

@@ -93,8 +93,9 @@ func (h *MessageHandlers) OnStream(stream Stream) error {
 
 // OnRequest handles an incoming request: dispatches to RPC and sends back the response.
 func (h *MessageHandlers) OnRequest(req Request, sendFn func(data []byte) error) {
-	log.Printf("🚗 收到指令: %+v", req)
-
+	if !IsQuietRequest(req) {
+		log.Printf("🚗 收到指令: %+v", req)
+	}
 	resp, err := GetRPC().OnRequest(req)
 	if err != nil {
 		resp = ErrorResponse(req.ID, err)
