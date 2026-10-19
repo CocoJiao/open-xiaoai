@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
-	"uuid"
+	"github.com/google/uuid"
 
 	"github.com/cxjava/open-xiaoai/tools/client-patch/internal/account"
 	"github.com/cxjava/open-xiaoai/tools/client-patch/internal/logger"

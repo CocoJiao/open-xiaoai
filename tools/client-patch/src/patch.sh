@@ -22,7 +22,7 @@ apply_patches() {
                     echo "  📝 [patch] 应用 $(basename "$file")"
                     local temp_patch=$(mktemp)
                     sed "s|{SSH_PASSWORD}|$PASSWORD|g" "$file" > "$temp_patch"
-                    patch -p1 < "$temp_patch"
+                    patch -p1 --no-backup-if-mismatch < "$temp_patch"
                     rm "$temp_patch"
                 elif [[ "$file" == *.sh ]]; then
                     echo "  📜 [patch] 执行 $(basename "$file")"

@@ -1,0 +1,10 @@
+# 构建脚本与补丁必须是 LF：否则在 Windows 检出后，
+# 容器里 `bash build.sh` 会报 $'\r': command not found，
+# 且 patch 无法干净应用。
+*.sh    text eol=lf
+*.patch text eol=lf
+*.go    text eol=lf
+*.py    text eol=lf
+Dockerfile text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf

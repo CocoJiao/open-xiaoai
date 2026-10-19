@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"uuid"
+	"github.com/google/uuid"
 
 	"github.com/joho/godotenv"
 

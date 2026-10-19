@@ -29,7 +29,7 @@ echo "📦 [squashfs] 压缩: $COMPRESSION, 块大小: $BLOCKSIZE"
 echo "🔥 [squashfs] 正在重新打包固件..."
 mksquashfs squashfs-root $FIRMWARE/root-patched.squashfs \
     -comp $COMPRESSION -b $BLOCKSIZE \
-    -noappend -all-root -always-use-fragments -no-xattrs -no-exports
+    -noappend -all-root -no-xattrs
 
 MODEL=$(cat $BASE_DIR/assets/.model)
 IMAGE_MAX_SIZE=0
@@ -59,7 +59,7 @@ REMAINING_BYTES=$((IMAGE_MAX_SIZE - SIZE))
 REMAINING_MB=$((REMAINING_BYTES / 1024 / 1024))
 echo "✅ [squashfs] 固件大小检查通过，剩余可用空间: $REMAINING_BYTES 字节 ($REMAINING_MB MB)"
 
-cp -rf $FIRMWARE $BASE_DIR/assets/$FIRMWARE
+cp -f "$FIRMWARE/root-patched.squashfs" "$BASE_DIR/assets/$FIRMWARE/"
 
 echo "✅ [squashfs] 打包完成，固件文件已复制到 assets 目录"
 echo "   $BASE_DIR/assets/$FIRMWARE/root-patched.squashfs"
