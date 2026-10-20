@@ -206,21 +206,6 @@ func LoadSources(dir string) (*Registry, error) {
 		log.Printf("✅ [lx-go] 已加载音源: %s (文件: %s)，支持平台: %s", name, file, summarizeSources(engine.Sources()))
 	}
 
-	// 大多数第三方音源脚本只实现 musicUrl（取直链），不实现 search（搜索）。
-	// 补一个内置的搜索兜底源，保证 GET /api/music/search 至少对 wy/kw/mg 可用；
-	// 优先级最低，用户自己放的脚本如果以后也支持了 search 会优先被使用。
-	if _, dup := seen[builtinSearchSourceName]; !dup {
-		if engine, err := NewEngine(builtinSearchSourceName, builtinSearchScript); err != nil {
-			log.Printf("❌ [lx-go] 内置搜索源加载失败: %v", err)
-		} else if ok, info := selfTestSource(engine); !ok {
-			log.Printf("❌ [lx-go] 内置搜索源自检失败，未加入音源列表: %s", info)
-			engine.Close()
-		} else {
-			reg.Sources = append(reg.Sources, &Source{Name: builtinSearchSourceName, File: "(内置)", Engine: engine})
-			log.Printf("✅ [lx-go] 已加载音源: %s (内置)，%s，支持平台: %s", builtinSearchSourceName, info, summarizeSources(engine.Sources()))
-		}
-	}
-
 	if len(reg.Sources) == 0 {
 		log.Printf("⚠️  [lx-go] 没有任何音源脚本加载成功，search/url 接口将始终失败")
 	}
@@ -275,8 +260,20 @@ func (r *Registry) Candidates(platform, action string) []*Source {
 // 底层能力；HTTP 层的 GET /api/music/search（见 api.go）在这个基础上还加了一层
 // 响应缓存和"默认搜索音源优先"的调整，不直接复用这个方法。
 func (r *Registry) Search(ctx context.Context, platform, keyword string, limit int) ([]map[string]any, string, error) {
+	var nativeErr error
+	if nativeSearchSupports(platform) {
+		items, err := nativeSearch(ctx, platform, keyword, limit)
+		if err == nil {
+			return items, nativeSearchSource, nil
+		}
+		nativeErr = fmt.Errorf("%s: %w", nativeSearchSource, err)
+	}
+
 	candidates := r.Candidates(platform, "search")
 	if len(candidates) == 0 {
+		if nativeErr != nil {
+			return nil, "", nativeErr
+		}
 		return nil, "", fmt.Errorf("no loaded source supports search for platform %q", platform)
 	}
 
@@ -285,7 +282,7 @@ func (r *Registry) Search(ctx context.Context, platform, keyword string, limit i
 		payload["limit"] = limit
 	}
 
-	var lastErr error
+	lastErr := nativeErr
 	for _, src := range candidates {
 		result, err := src.Engine.Call(ctx, "request", map[string]any{
 			"action": "search",

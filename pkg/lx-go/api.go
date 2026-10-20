@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -160,22 +161,43 @@ func (s *Server) handleMusicSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ctx, cancel := context.WithTimeout(r.Context(), sourceRequestTime)
+	defer cancel()
+
+	var lastErr error
+	if nativeSearchSupports(platform) {
+		n := 0
+		if limit != "" {
+			n, _ = strconv.Atoi(limit)
+		}
+		log.Printf("🔍 [music/search] 当前使用音源: %s，platform=%s keyword=%q", nativeSearchSource, platform, keyword)
+		items, err := nativeSearch(ctx, platform, keyword, n)
+		if err == nil {
+			log.Printf("✅ [music/search] 音源 %s 命中，platform=%s keyword=%q", nativeSearchSource, platform, keyword)
+			s.cacheSet(cacheKey, items, searchCacheTTL)
+			writeJSON(w, items)
+			return
+		}
+		log.Printf("⚠️  [music/search] 原生搜索失败 (%v)，回退到脚本 search", err)
+		lastErr = err
+	}
+
 	candidates := s.registry.Candidates(platform, "search")
+	if len(candidates) == 0 && lastErr != nil {
+		http.Error(w, fmt.Sprintf("native search failed: %v", lastErr), http.StatusInternalServerError)
+		return
+	}
 	if len(candidates) == 0 {
 		http.Error(w, fmt.Sprintf("no loaded source supports search for platform %q", platform), http.StatusNotFound)
 		return
 	}
 	candidates = s.reorderWithDefaultSearchFirst(candidates)
 
-	ctx, cancel := context.WithTimeout(r.Context(), sourceRequestTime)
-	defer cancel()
-
 	payload := map[string]any{"keyword": keyword}
 	if limit != "" {
 		payload["limit"] = limit
 	}
 
-	var lastErr error
 	for _, src := range candidates {
 		log.Printf("🔍 [music/search] 当前使用音源: %s，platform=%s keyword=%q", src.Name, platform, keyword)
 		result, err := src.Engine.Call(ctx, "request", map[string]any{
