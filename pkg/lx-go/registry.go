@@ -155,12 +155,15 @@ func LoadSources(dir string) (*Registry, error) {
 
 	reg := &Registry{}
 	seen := make(map[string]string) // name -> 已加载的文件名，用于检测冲突
+	report := &loadReport{dir: dir}
+	defer report.print()
 
 	for _, file := range files {
 		full := filepath.Join(dir, file)
 		raw, err := os.ReadFile(full)
 		if err != nil {
 			log.Printf("⚠️  [lx-go] 读取音源文件失败，已跳过: %s (%v)", file, err)
+			report.add(file, file, loadFailed, fmt.Sprintf("读取失败: %v", err))
 			continue
 		}
 
@@ -172,12 +175,14 @@ func LoadSources(dir string) (*Registry, error) {
 
 		if existing, dup := seen[name]; dup {
 			log.Printf("⚠️  [lx-go] 音源名称冲突: %s (文件: %s) 与已加载的 %s 同名，已跳过，只使用先加载的那个", name, file, existing)
+			report.add(file, name, loadDuplicate, "与 "+existing+" 同名，未使用")
 			continue
 		}
 
 		engine, err := NewEngine(name, string(raw))
 		if err != nil {
 			log.Printf("❌ [lx-go] 音源加载失败，已跳过: %s (文件: %s) 错误: %v", name, file, err)
+			report.add(file, name, loadFailed, fmt.Sprintf("脚本加载失败: %v", err))
 			continue
 		}
 
@@ -185,6 +190,7 @@ func LoadSources(dir string) (*Registry, error) {
 		if ok, info := selfTestSource(engine); !ok {
 			log.Printf("❌ [lx-go] %s，未加入音源列表: %s (文件: %s)，请检查该脚本或其上游接口是否可用", info, name, file)
 			engine.Close()
+			report.add(file, name, loadFailed, info)
 			continue
 		} else {
 			log.Printf("✅ [lx-go] %s: %s", name, info)
@@ -192,22 +198,12 @@ func LoadSources(dir string) (*Registry, error) {
 
 		seen[name] = file
 		reg.Sources = append(reg.Sources, &Source{Name: name, File: file, Engine: engine})
-		log.Printf("✅ [lx-go] 已加载音源: %s (文件: %s)，支持平台: %s", name, file, summarizeSources(engine.Sources()))
-	}
-
-	// 大多数第三方音源脚本只实现 musicUrl（取直链），不实现 search（搜索）。
-	// 补一个内置的搜索兜底源，保证 GET /api/music/search 至少对 wy/kw/mg 可用；
-	// 优先级最低，用户自己放的脚本如果以后也支持了 search 会优先被使用。
-	if _, dup := seen[builtinSearchSourceName]; !dup {
-		if engine, err := NewEngine(builtinSearchSourceName, builtinSearchScript); err != nil {
-			log.Printf("❌ [lx-go] 内置搜索源加载失败: %v", err)
-		} else if ok, info := selfTestSource(engine); !ok {
-			log.Printf("❌ [lx-go] 内置搜索源自检失败，未加入音源列表: %s", info)
-			engine.Close()
-		} else {
-			reg.Sources = append(reg.Sources, &Source{Name: builtinSearchSourceName, File: "(内置)", Engine: engine})
-			log.Printf("✅ [lx-go] 已加载音源: %s (内置)，%s，支持平台: %s", builtinSearchSourceName, info, summarizeSources(engine.Sources()))
+		status := loadOK
+		if len(engine.Sources()) == 0 {
+			status = loadUntested
 		}
+		report.add(file, name, status, summarizeSources(engine.Sources()))
+		log.Printf("✅ [lx-go] 已加载音源: %s (文件: %s)，支持平台: %s", name, file, summarizeSources(engine.Sources()))
 	}
 
 	if len(reg.Sources) == 0 {
@@ -264,8 +260,20 @@ func (r *Registry) Candidates(platform, action string) []*Source {
 // 底层能力；HTTP 层的 GET /api/music/search（见 api.go）在这个基础上还加了一层
 // 响应缓存和"默认搜索音源优先"的调整，不直接复用这个方法。
 func (r *Registry) Search(ctx context.Context, platform, keyword string, limit int) ([]map[string]any, string, error) {
+	var nativeErr error
+	if nativeSearchSupports(platform) {
+		items, err := nativeSearch(ctx, platform, keyword, limit)
+		if err == nil {
+			return items, nativeSearchSource, nil
+		}
+		nativeErr = fmt.Errorf("%s: %w", nativeSearchSource, err)
+	}
+
 	candidates := r.Candidates(platform, "search")
 	if len(candidates) == 0 {
+		if nativeErr != nil {
+			return nil, "", nativeErr
+		}
 		return nil, "", fmt.Errorf("no loaded source supports search for platform %q", platform)
 	}
 
@@ -274,7 +282,7 @@ func (r *Registry) Search(ctx context.Context, platform, keyword string, limit i
 		payload["limit"] = limit
 	}
 
-	var lastErr error
+	lastErr := nativeErr
 	for _, src := range candidates {
 		result, err := src.Engine.Call(ctx, "request", map[string]any{
 			"action": "search",
@@ -341,6 +349,23 @@ func (r *Registry) ResolveURL(ctx context.Context, platform string, songInfo map
 }
 
 func toSongList(result any) ([]map[string]any, error) {
+	// 部分脚本返回 {list:[...]} / {data:[...]} / {data:{list:[...]}} 这类包装对象
+	for depth := 0; depth < 2; depth++ {
+		obj, isMap := result.(map[string]interface{})
+		if !isMap {
+			break
+		}
+		found := false
+		for _, k := range []string{"list", "data", "songs", "result"} {
+			if v, ok := obj[k]; ok && v != nil {
+				result, found = v, true
+				break
+			}
+		}
+		if !found {
+			break
+		}
+	}
 	arr, ok := result.([]interface{})
 	if !ok {
 		return nil, fmt.Errorf("unexpected search result shape: %T", result)

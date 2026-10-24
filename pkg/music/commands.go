@@ -133,6 +133,27 @@ var clearDefaultStoryKeywords = []string{"清除默认故事", "取消默认故�
 // 数字的关键词全部失配。如果用户明确想播某集，加上"集"/"回"即可。
 var episodeRegex = regexp.MustCompile(`(?:第)?([0-9零〇一二三四五六七八九十百千两]+)[集回]`)
 
+// artistIntentRegex 识别"XX的歌"：周杰伦的歌、周杰伦的歌曲、歌手周杰伦的音乐、一些周杰伦的歌吧。
+// 只认"歌/歌曲/音乐"，"XX的故事"之类不会误命中。
+var artistIntentRegex = regexp.MustCompile(`^(?:一些|几首|一首|点|些)?(?:歌手)?(.+?)的(?:歌曲|歌|音乐|作品)(?:吧|呀|啊)?$`)
+
+// ParseArtistIntent 从播放关键词里解析"XX的歌"，返回歌手名。
+func ParseArtistIntent(keyword string) (string, bool) {
+	cleaned, isStory := NormalizePlayKeyword(keyword)
+	if isStory {
+		return "", false
+	}
+	m := artistIntentRegex.FindStringSubmatch(NormalizedForMatch(cleaned))
+	if len(m) < 2 {
+		return "", false
+	}
+	artist := Normalize(m[1])
+	if artist == "" || artist == "我" || artist == "我收藏" || artist == "收藏" {
+		return "", false
+	}
+	return artist, true
+}
+
 // ParsePlayIntent 从播放关键词中解析系列名和集数
 // 例如：「西游记11集」-> {SeriesName:"西游记", Episode:11}
 //

@@ -280,7 +280,7 @@ func (i *Indexer) Refresh() error {
 		// size/mtime 没变也要强制重新提取一次，把时长补上，不然看门狗永远拿不到这首歌的
 		// 真实时长（会一直被当成"未知"跳过，起不到兜底作用）。只在文件本身没变时补一次，
 		// 补上之后下次 Refresh 就会走"未变直接复用"分支，不会每次启动都重新探测。
-		needsDurationBackfill := ok && old.DurationMs == 0 && strings.EqualFold(filepath.Ext(path), ".mp3")
+		needsDurationBackfill := ok && old.DurationMs == 0 && durationProbeable(path)
 		if !ok || old.Size != info.Size() || old.MtimeNs != info.ModTime().UnixNano() || needsDurationBackfill {
 			needRefresh = append(needRefresh, path)
 		}
@@ -291,7 +291,7 @@ func (i *Indexer) Refresh() error {
 	for _, path := range files {
 		if old, ok := oldByPath[path]; ok {
 			info, err := os.Stat(path)
-			needsDurationBackfill := old.DurationMs == 0 && strings.EqualFold(filepath.Ext(path), ".mp3")
+			needsDurationBackfill := old.DurationMs == 0 && durationProbeable(path)
 			if err == nil && old.Size == info.Size() && old.MtimeNs == info.ModTime().UnixNano() && !needsDurationBackfill {
 				newSongs = append(newSongs, old)
 				continue
@@ -395,11 +395,11 @@ func extractMetadata(path string) (IndexedSong, error) {
 	s.NameLower = strings.ToLower(name)
 	s.Episode = extractEpisodeFromName(name)
 
-	if strings.EqualFold(ext, ".mp3") {
-		if dur, err := probeMP3Duration(path, s.Size); err == nil && dur > 0 {
+	if durationProbeable(path) {
+		if dur, err := probeAudioDuration(path, s.Size); err == nil && dur > 0 {
 			s.DurationMs = dur.Milliseconds()
 		} else if err != nil {
-			log.Printf("⚠️ [music/idx] 解析 mp3 时长失败 (看门狗对这首歌不生效): %s err=%v", path, err)
+			log.Printf("⚠️ [music/idx] 解析时长失败 (这首歌播完只能靠设备 Idle 切歌): %s err=%v", path, err)
 		}
 	}
 

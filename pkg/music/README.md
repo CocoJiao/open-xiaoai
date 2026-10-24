@@ -45,14 +45,14 @@ music:
 
   history:
     file: "cache/play_history.json"  # 播放历史文件（"继续播放故事"依赖它，只记录故事/有声书）
+    music_file: "cache/music_history.json"  # 普通音乐断点（当前曲+估算位置+剩余本地队列），"继续播放"用
+    favorites_file: "cache/favorites.json"  # 收藏列表
 
   commands:
      play_keywords: ["播放"]       # 前缀匹配，提取后缀为搜索关键词
      download_keywords: ["下载"]   # 明确下载在线歌曲，下载成功后播放
     stop_keywords:
       - "停止播放"
-      - "暂停播放"
-      - "暂停"
       - "停止"
       - "闭嘴"
       - "别放了"
@@ -60,6 +60,15 @@ music:
       - "关机"
     next_keywords: ["下一首", "下一个", "下一集", "下一章", "下一回", "下集", "换一集"]
     previous_keywords: ["上一首", "上一个", "上一集", "上一章", "上一回", "上集"]
+    pause_keywords: ["暂停", "暂停播放", "暂停一下", "先暂停"]   # 真暂停，保留队列和进度（优先级高于 stop_keywords）
+    resume_keywords: ["继续播放", "接着播放", "恢复播放"]           # 明确口令，任何时候都生效
+    resume_short_keywords: ["继续", "接着放", "继续放", "继续听", "接着听"]  # 短口令，仅音乐会话中生效
+    # 短控制口令（暂停/继续/下一首/上一首/收藏/取消收藏）只在有当前曲（播放中或暂停中）时才被
+    # 音乐模块接管，否则交还给 AI/小爱。设为 false 恢复为任何时候都接管。
+    session_only_short_commands: true
+    favorite_add_keywords: ["加入收藏", "收藏", "收藏这首", "收藏这首歌", "收藏歌曲", "我喜欢这首歌", "喜欢这首歌"]
+    favorite_remove_keywords: ["取消收藏", "取消收藏这首", "取消收藏这首歌", "不喜欢这首歌", "从收藏里删除"]
+    play_favorites_keywords: ["播放收藏", "播放我的收藏", "播放收藏歌单", "播放歌单收藏", "听收藏", "播放收藏的歌", "播放我收藏的歌"]
     continue_story_keywords: ["继续播放故事", "接着播放故事", "继续听故事", "接着听故事", "继续讲故事", "接着讲故事", "继续故事", "接着故事"]
     refresh_keywords: ["刷新曲库"]
     random_play_keywords: ["随便听听"]       # 随机取一批歌曲播放
@@ -82,10 +91,11 @@ music:
     username: ""                 # 可选：普通用户名；未配置 user_token 时自动登录获取 token
     password: ""                 # 可选：普通用户密码；日志不会打印此值
     frontend_auth: ""            # 可选：admin 管理口令；不建议日常播放依赖
-     download: false              # 已废弃为自动下载开关；普通播放始终在线播放
+     download: false              # true: 普通播放本地没有的歌时先下载再播（失败退回在线）；false: 在线直接播
     download_dir: ""             # 下载目录；空则使用 music.dirs[0]
-    source: "kw"                 # kw / tx / wy / kg / mg
-    quality: "128k"              # 128k / 320k / flac，取决于源和歌曲
+    source: "kw"                 # kw / tx / wy / kg / mg；可写多个："wy,kw" 或 [wy, kw]
+                                 # 多个时并发搜索所有平台、合并打分；同样匹配的歌按这里的顺序优先
+    quality: "128k"              # 128k / 320k / flac；可写多个："320k,128k"，按顺序尝试，取不到就降级
     timeout_sec: 10
 
   # 播放器行为（可选）
@@ -448,7 +458,13 @@ music:
 | 下一首 / 上一首 | 切换队列中的下一首或上一首 |
 | 随便听听 | 随机取 N 首歌曲播放（优先排除 `stories[].dir` 下的故事文件） |
 | 单曲循环 / 全部循环 / 随机播放 | 切换播放模式 |
-| 停止 / 暂停 / 闭嘴 | 清空队列并停止 |
+| 播放周杰伦的歌 / 播放歌手周杰伦的音乐 | 本地按 artist 标签筛选该歌手的歌；本地没有则在线搜索该歌手的多首歌（去重、跳过伴奏/DJ/Live），播到哪首再取直链 |
+| 暂停 | 真暂停（`mphelper pause`），保留队列和进度 |
+| 继续 / 下一首 / 收藏 等短口令 | 仅在音乐会话中（有当前曲，播放或暂停）生效；没在放歌时交还给 AI/小爱 |
+| 继续播放 / 继续 | 暂停中则原地恢复；否则按最近的音乐断点（或故事历史，取更新的那个）接着播，断点位置回退 3 秒后 `player_set_positon` 跳过去 |
+| 加入收藏 / 取消收藏 | 收藏/取消当前歌曲（本地按路径，在线按歌手+歌名） |
+| 播放收藏 | 播放收藏列表，在线歌曲播到时重新搜索取直链 |
+| 停止 / 闭嘴 | 记录断点后清空队列并停止 |
 | 刷新曲库 | 重新扫描目录并更新索引 |
 
 ### LX Sync Server 在线兜底
@@ -456,7 +472,7 @@ music:
 > `随便听听` 默认按"听歌"语义处理：若配置了 `stories[].dir`，会优先从非故事目录随机取歌，避免随机到故事集。
 > 若未配置 `stories[].dir`，模块无法区分故事与歌曲，随机结果会来自整个曲库。
 
-启用 `music.lx.enabled` 后，`播放某首歌` 会先搜索本地曲库；如果本地没有命中且不是故事/有声书集数播放，就会走在线兜底搜索/取直链。支持三种接法，看你怎么部署：
+启用 `music.lx.enabled` 后，`播放某首歌` 会先搜索本地曲库；如果本地没有命中且不是故事/有声书集数播放，就会走在线兜底搜索/取直链。在线结果不再直接取第一个：会按"关键词能否由歌手+歌名拼出"重新打分（支持「周杰伦晴天」「晴天周杰伦」「周杰伦的晴天」），对用户没说的伴奏/DJ/Live/翻唱版本降权，并按分数依次尝试前 3 个候选取直链。支持三种接法，看你怎么部署：
 
 - **内嵌模式（推荐）**：`pkg/lx-go` 直接以 Go 库的形式 import 进 `pkg/music` 进程里，不用你手动另起进程/端口，搜索/取直链全是进程内函数调用。
 - **独立服务模式**：单独跑一个 `pkg/lx-go` 进程，`pkg/music` 通过 HTTP（`base_url`）对接，两边可以分开部署在不同机器上。
@@ -471,7 +487,7 @@ music:
     enabled: true
     embedded: true
     embedded_js_dir: "../lx-go/js"   # 指向音源脚本（可以多个）目录，相对/绝对路径都行
-    download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # true 时普通播放也先下载再播；false 只在说“下载歌曲”时保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "wy"
     quality: "128k"
@@ -492,7 +508,7 @@ music:
   lx:
     enabled: true
     base_url: "http://127.0.0.1:8080"   # pkg/lx-go 默认端口，和 music 自己的文件服务端口 18080 不冲突
-    download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # true 时普通播放也先下载再播；false 只在说“下载歌曲”时保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "wy"
     quality: "128k"
@@ -520,7 +536,7 @@ music:
     base_url: "http://localhost:9527"
     username: "your_lx_user"
     password: "your_lx_password"
-    download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # true 时普通播放也先下载再播；false 只在说“下载歌曲”时保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "kw"
     quality: "128k"
@@ -538,7 +554,7 @@ music:
 
 运行时会打印 LX 搜索请求、搜索返回摘要、取直链请求、取直链返回摘要以及最终远程播放 URL；日志会隐藏登录 token，也不会打印密码。
 
-说“下载稻香”或“下载周杰伦的稻香”时，在线歌曲会通过 LX 的 `/api/music/download` 代理下载到本地，默认保存为 `歌名 - 歌手.mp3`，下载成功后自动播放。如果文件已存在会直接复用并播放本地文件，下载后会刷新曲库索引，后续本地搜索可以直接命中。普通“播放”只播放在线歌曲，不会自动下载。
+说“下载稻香”或“下载周杰伦的稻香”时，在线歌曲会通过 LX 的 `/api/music/download` 代理下载到本地，默认保存为 `歌名 - 歌手.mp3`，下载成功后自动播放。如果文件已存在会直接复用并播放本地文件，下载后会刷新曲库索引，后续本地搜索可以直接命中。普通“播放”默认在线直接播；设置 `lx.download: true` 后会先下载到本地再播放，下载失败时退回在线直链。
 
 #### 本地优先与远程触发规则
 

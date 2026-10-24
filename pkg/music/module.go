@@ -46,6 +46,10 @@ type Module struct {
 	// history 播放历史持久化（只针对故事/有声书）：记录"最近播放到哪个系列第几集"，
 	// 支撑"继续播放故事"跨会话/跨重启恢复。参见 history.go。
 	history *PlayHistoryStore
+
+	// musicHistory 普通音乐的播放断点（"继续播放"用），favorites 收藏列表。
+	musicHistory *MusicHistoryStore
+	favorites    *FavoritesStore
 }
 
 type lxResolver interface {
@@ -82,6 +86,9 @@ func New(cfg *MusicConfig) *Module {
 		lx:      lx,
 		jobWake: make(chan struct{}, 1),
 		history: NewPlayHistoryStore(cfg.History.File),
+
+		musicHistory: NewMusicHistoryStore(cfg.History.MusicFile),
+		favorites:    NewFavoritesStore(cfg.History.FavoritesFile),
 	}
 }
 
@@ -120,6 +127,12 @@ func (m *Module) Start(ctx context.Context) error {
 		WithOnEpisodeChange(func(item SongItem) {
 			m.history.Update(item.SeriesName, item.Episode, item.Path)
 		}),
+		WithOnSongChange(func(item SongItem) {
+			if item.Episode > 0 {
+				return
+			}
+			m.recordMusicProgress()
+		}),
 	)
 
 	// 先尝试加载磁盘缓存，让 Start 立刻就能用到已有曲库。
@@ -130,6 +143,12 @@ func (m *Module) Start(ctx context.Context) error {
 	}
 	if err := m.history.Load(); err != nil {
 		log.Printf("⚠️ [music] 加载播放历史失败: %v", err)
+	}
+	if err := m.musicHistory.Load(); err != nil {
+		log.Printf("⚠️ [music] 加载音乐断点失败: %v", err)
+	}
+	if err := m.favorites.Load(); err != nil {
+		log.Printf("⚠️ [music] 加载收藏失败: %v", err)
 	}
 
 	// 启动 HTTP 文件服务
@@ -150,6 +169,15 @@ func (m *Module) Start(ctx context.Context) error {
 		defer m.refreshWg.Done()
 		m.player.WatchdogLoop(m.ctx)
 	}()
+
+	// 设备状态轮询：电平触发驱动切歌，见 device_poll.go
+	if pollSec := *m.config.Player.StatusPollSec; pollSec > 0 {
+		m.refreshWg.Add(1)
+		go func() {
+			defer m.refreshWg.Done()
+			m.player.DeviceStatusLoop(m.ctx, time.Duration(pollSec)*time.Second)
+		}()
+	}
 
 	// 播放期间周期性 AbortXiaoAI：防止小爱云端在后台重新连接后把"之前暂停的故事/新闻"
 	// resume 到 mediaplayer，抢占我们本地队列。只在 abort_xiaoai_on_play 开启且间隔>0 时启动。
@@ -292,6 +320,7 @@ func (m *Module) Stop() error {
 		cancel()
 	}
 	if m.player != nil {
+		m.recordMusicProgress()
 		m.player.ClearQueue()
 	}
 	if closer, ok := m.lx.(io.Closer); ok {
@@ -378,23 +407,28 @@ func (m *Module) classifyInstruction(text, normalized string) func() {
 		}
 	}
 
+	if job := m.classifyShortCommand(normalized); job != nil {
+		return job
+	}
+
 	switch {
+	case m.matchExact(normalized, m.config.Commands.ResumeKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 resume_keywords")
+			m.handleResume()
+		}
+	case m.matchExact(normalized, m.config.Commands.PlayFavoritesKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 play_favorites_keywords")
+			m.handlePlayFavorites()
+		}
 	case m.matchExact(normalized, m.config.Commands.StopKeywords):
 		return func() {
 			log.Printf("🎯 [music] 命中 stop_keywords")
+			m.recordMusicProgress()
 			m.player.ClearQueue()
 			_ = m.player.Stop()
 			m.player.Speak("好的，已停止")
-		}
-	case m.matchExact(normalized, m.config.Commands.NextKeywords):
-		return func() {
-			log.Printf("🎯 [music] 命中 next_keywords")
-			m.handleNext()
-		}
-	case m.matchExact(normalized, m.config.Commands.PreviousKeywords):
-		return func() {
-			log.Printf("🎯 [music] 命中 previous_keywords")
-			m.handlePrevious()
 		}
 	case m.matchExact(normalized, m.config.Commands.RepeatOneKeywords):
 		return func() {
@@ -567,6 +601,9 @@ func (m *Module) applyDefaultStoryContext(intent PlayIntent) PlayIntent {
 }
 
 func (m *Module) handlePlay(keyword string) bool {
+	if artist, ok := ParseArtistIntent(keyword); ok {
+		return m.handleArtistPlay(artist)
+	}
 	intent := ParsePlayIntent(keyword)
 	intent = m.applyDefaultStoryContext(intent)
 	return m.playIntent(intent, false)
@@ -782,16 +819,38 @@ func (m *Module) handleLXPlay(keyword string) bool {
 		return false
 	}
 
-	m.maybeAbortXiaoAI()
 	name := track.Name
 	if name == "" {
 		name = keyword
 	}
+	// lx.download=true：先下载到本地再播放本地文件；下载失败退回在线直链。
+	if m.config.LX.Download {
+		if item, ok := m.downloadLXTrack(ctx, track, name); ok {
+			item.Title = name
+			item.Singer = track.Singer
+			if song, found := m.indexer.SongByPath(item.Path); found {
+				item.Size, item.DurationMs = song.Size, song.DurationMs
+			}
+			if item.DurationMs == 0 {
+				item.DurationMs = track.DurationMs
+			}
+			m.maybeAbortXiaoAI()
+			_ = m.player.Speak(fmt.Sprintf("好的，已下载并播放%s", name))
+			m.player.SetExhaustedHandler(nil)
+			m.player.SetQueue([]SongItem{item})
+			return true
+		}
+		log.Printf("⚠️ [music/lx] 下载失败，改为在线播放: %s", name)
+	}
+	m.maybeAbortXiaoAI()
 	_ = m.player.Speak(fmt.Sprintf("好的，当前播放的是在线歌曲%s", name))
 	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue([]SongItem{{
-		Path: fmt.Sprintf("lx:%s-%s", track.Singer, name),
-		URL:  track.URL,
+		Path:       fmt.Sprintf("lx:%s-%s", track.Singer, name),
+		URL:        track.URL,
+		Title:      name,
+		Singer:     track.Singer,
+		DurationMs: track.DurationMs,
 	}})
 	return true
 }

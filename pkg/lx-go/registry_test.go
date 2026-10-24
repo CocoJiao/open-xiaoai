@@ -1,6 +1,7 @@
 package lxgo
 
 import (
+	"os"
 	"testing"
 )
 
@@ -95,4 +96,9 @@ func TestSelfTestSourceSkippedWhenNeitherActionSupported(t *testing.T) {
 	if !ok {
 		t.Fatal("expected self-test to be skipped (pass-through) when neither search nor wy musicUrl is supported")
 	}
+}
+
+func TestMain(m *testing.M) {
+	nativeSearchEnabled = false
+	os.Exit(m.Run())
 }

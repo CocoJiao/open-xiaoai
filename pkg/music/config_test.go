@@ -33,10 +33,10 @@ func TestApplyDefaultsAddsLXDefaults(t *testing.T) {
 	var cfg MusicConfig
 	cfg.ApplyDefaults()
 
-	if cfg.LX.Source != "kw" {
+	if cfg.LX.Source.String() != "kw" {
 		t.Fatalf("expected default LX source kw, got %q", cfg.LX.Source)
 	}
-	if cfg.LX.Quality != "128k" {
+	if cfg.LX.Quality.String() != "128k" {
 		t.Fatalf("expected default LX quality 128k, got %q", cfg.LX.Quality)
 	}
 	if cfg.LX.TimeoutSec != 10 {

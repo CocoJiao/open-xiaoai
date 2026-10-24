@@ -1,5 +1,7 @@
 package music
 
+import "strings"
+
 // MusicConfig 音乐模块配置
 type MusicConfig struct {
 	Enabled    bool           `yaml:"enabled"`
@@ -19,6 +21,10 @@ type MusicConfig struct {
 // "继续播放故事"语音指令。普通音乐/在线歌曲不记录（没有"集"的概念）。
 type HistoryConfig struct {
 	File string `yaml:"file"` // 历史记录文件路径，空则用默认值 cache/play_history.json
+	// MusicFile 普通音乐播放断点（"继续播放"用），空则用 cache/music_history.json
+	MusicFile string `yaml:"music_file"`
+	// FavoritesFile 收藏列表，空则用 cache/favorites.json
+	FavoritesFile string `yaml:"favorites_file"`
 }
 
 // StoryConfig 故事/有声书配置
@@ -53,6 +59,25 @@ type CommandsConfig struct {
 	// 最近一次系列名+集数，自动接着播放，不需要用户报出系列名。只针对故事/有声书场景，
 	// 刻意不做成通用的"继续播放"（避免和普通音乐/暂停恢复语义混淆）。
 	ContinueStoryKeywords []string `yaml:"continue_story_keywords"`
+
+	// PauseKeywords 真正的暂停：保留队列和进度，"继续播放"可原地恢复。
+	// 优先级高于 stop_keywords（旧配置里 stop_keywords 含"暂停"也会按暂停处理）。
+	PauseKeywords []string `yaml:"pause_keywords"`
+	// ResumeKeywords 明确的"继续播放"：任何时候都生效。暂停中原地恢复；否则按音乐断点
+	// （或故事历史，取更新的那个）接着播。
+	ResumeKeywords []string `yaml:"resume_keywords"`
+	// ResumeShortKeywords 短口令"继续/接着听"：只在音乐会话活跃时生效（见 SessionOnlyShortCommands）。
+	ResumeShortKeywords []string `yaml:"resume_short_keywords"`
+
+	// SessionOnlyShortCommands 为 true（默认）时，短控制口令（暂停、继续、下一首、上一首、
+	// 收藏/取消收藏）只在音乐会话活跃（有当前曲，播放中或暂停中）时才由音乐模块接管；
+	// 否则交还给上层 AI/小爱，避免聊天时说"继续""下一个"被音乐模块截胡。
+	SessionOnlyShortCommands *bool `yaml:"session_only_short_commands,omitempty"`
+	// FavoriteAddKeywords / FavoriteRemoveKeywords 收藏/取消收藏当前歌曲
+	FavoriteAddKeywords    []string `yaml:"favorite_add_keywords"`
+	FavoriteRemoveKeywords []string `yaml:"favorite_remove_keywords"`
+	// PlayFavoritesKeywords 播放收藏列表
+	PlayFavoritesKeywords []string `yaml:"play_favorites_keywords"`
 
 	// AbortXiaoAIOnPlay：handlePlay 时是否同步重启 mico_aivs_lab，杀掉小爱云端 NLP 流水线。
 	// 解决"我们 player_play_url 本地歌后，小爱云端识别同一句话再返回试听版 URL 覆盖我们"的竞态。
@@ -94,11 +119,15 @@ type LXConfig struct {
 	UserToken    string `yaml:"user_token"`
 	Username     string `yaml:"username"`
 	Password     string `yaml:"password"`
-	Download     bool   `yaml:"download"`
+	Download     bool   `yaml:"download"` // true: 普通播放的在线歌曲先下载到本地再播（失败退回在线）
 	DownloadDir  string `yaml:"download_dir"`
-	Source       string `yaml:"source"`
-	Quality      string `yaml:"quality"`
-	TimeoutSec   int    `yaml:"timeout_sec"`
+	// Source 在线搜索的平台，可写单个（"kw"）、逗号分隔（"wy,kw"）或列表（[wy, kw]）。
+	// 多个时会同时搜索所有平台，合并结果打分；同样匹配的歌按这里的顺序优先。
+	Source StringList `yaml:"source"`
+	// Quality 音质，同样支持单个或多个（"320k,128k"）。取直链时按顺序尝试，
+	// 前一个音质取不到再退到下一个。
+	Quality    StringList `yaml:"quality"`
+	TimeoutSec int        `yaml:"timeout_sec"`
 
 	// Embedded 为 true 时，不走 base_url 请求外部/独立起的 LX Sync Server，
 	// 而是直接在本进程内加载 pkg/lx-go 引擎（不需要手动另起一个进程/端口）。
@@ -155,6 +184,11 @@ type PlayerConfig struct {
 	// 默认开启（true）：方便小朋友知道当前进度、中断后能知道听到第几集。
 	// 设为 false 可关闭这段播报，直接播放音频内容。
 	AnnounceEpisodeBeforePlay *bool `yaml:"announce_episode_before_play,omitempty"`
+
+	// StatusPollSec 服务端主动轮询设备播放状态（player_get_play_status）的间隔，默认 1 秒，0 关闭。
+	// 用设备报告的位置/时长驱动切歌：快播完提前切、设备空闲切、内容被设备续播接管时抢回。
+	// 不再只依赖客户端的状态变化事件（边沿触发，歌曲结束瞬间被设备续播接上时会漏掉）。
+	StatusPollSec *int `yaml:"status_poll_sec,omitempty"`
 }
 
 // DefaultExtensions 默认支持的音频扩展名
@@ -167,7 +201,7 @@ const DefaultEpisodePattern = `第?(\d+)[集回]?`
 var DefaultCommands = CommandsConfig{
 	PlayKeywords:     []string{"播放"},
 	DownloadKeywords: []string{"下载"},
-	StopKeywords:     []string{"停止播放", "暂停播放", "暂停", "停止", "闭嘴", "别放了", "不要放了", "关机"},
+	StopKeywords:     []string{"停止播放", "停止", "闭嘴", "别放了", "不要放了", "关机"},
 	// 覆盖"首/个"（普通音乐语境）和"集/章/回"（故事/有声书按集播放语境）两类说法，
 	// 否则用户在听故事时说"下一集"会因为 matchExact 精确匹配不上"下一首"而被当成
 	// 非音乐指令直接忽略（实测过的真实 bug）。
@@ -181,6 +215,16 @@ var DefaultCommands = CommandsConfig{
 	ContinueStoryKeywords: []string{
 		"继续播放故事", "接着播放故事", "继续听故事", "接着听故事",
 		"继续讲故事", "接着讲故事", "继续故事", "接着故事",
+	},
+	PauseKeywords:       []string{"暂停", "暂停播放", "暂停一下", "先暂停"},
+	ResumeKeywords:      []string{"继续播放", "接着播放", "恢复播放"},
+	ResumeShortKeywords: []string{"继续", "接着放", "继续放", "继续听", "接着听"},
+	FavoriteAddKeywords: []string{
+		"加入收藏", "收藏", "收藏这首", "收藏这首歌", "收藏歌曲", "我喜欢这首歌", "喜欢这首歌",
+	},
+	FavoriteRemoveKeywords: []string{"取消收藏", "取消收藏这首", "取消收藏这首歌", "不喜欢这首歌", "从收藏里删除"},
+	PlayFavoritesKeywords: []string{
+		"播放收藏", "播放我的收藏", "播放收藏歌单", "播放歌单收藏", "听收藏", "播放收藏的歌", "播放我收藏的歌",
 	},
 }
 
@@ -199,11 +243,17 @@ func (c *MusicConfig) ApplyDefaults() {
 	if c.History.File == "" {
 		c.History.File = "cache/play_history.json"
 	}
-	if c.LX.Source == "" {
-		c.LX.Source = "kw"
+	if c.History.MusicFile == "" {
+		c.History.MusicFile = "cache/music_history.json"
 	}
-	if c.LX.Quality == "" {
-		c.LX.Quality = "128k"
+	if c.History.FavoritesFile == "" {
+		c.History.FavoritesFile = "cache/favorites.json"
+	}
+	if len(c.LX.Source) == 0 {
+		c.LX.Source = StringList{"kw"}
+	}
+	if len(c.LX.Quality) == 0 {
+		c.LX.Quality = StringList{"128k"}
 	}
 	if c.LX.TimeoutSec <= 0 {
 		c.LX.TimeoutSec = 10
@@ -252,6 +302,21 @@ func (c *MusicConfig) ApplyDefaults() {
 		c.Commands.ContinueStoryKeywords = make([]string, len(DefaultCommands.ContinueStoryKeywords))
 		copy(c.Commands.ContinueStoryKeywords, DefaultCommands.ContinueStoryKeywords)
 	}
+	fill := func(dst *[]string, def []string) {
+		if len(*dst) == 0 {
+			*dst = append([]string(nil), def...)
+		}
+	}
+	fill(&c.Commands.PauseKeywords, DefaultCommands.PauseKeywords)
+	fill(&c.Commands.ResumeKeywords, DefaultCommands.ResumeKeywords)
+	fill(&c.Commands.ResumeShortKeywords, DefaultCommands.ResumeShortKeywords)
+	if c.Commands.SessionOnlyShortCommands == nil {
+		t := true
+		c.Commands.SessionOnlyShortCommands = &t
+	}
+	fill(&c.Commands.FavoriteAddKeywords, DefaultCommands.FavoriteAddKeywords)
+	fill(&c.Commands.FavoriteRemoveKeywords, DefaultCommands.FavoriteRemoveKeywords)
+	fill(&c.Commands.PlayFavoritesKeywords, DefaultCommands.PlayFavoritesKeywords)
 	if c.Commands.AbortXiaoAIOnPlay == nil {
 		// 默认开启：解决小爱云端 NLP 抢占本地播放的竞态问题
 		t := true
@@ -276,6 +341,10 @@ func (c *MusicConfig) ApplyDefaults() {
 		d := 0
 		c.Player.DiagnosticIntervalSec = &d
 	}
+	if c.Player.StatusPollSec == nil {
+		d := 1
+		c.Player.StatusPollSec = &d
+	}
 	if c.Player.AnnounceEpisodeBeforePlay == nil {
 		t := true
 		c.Player.AnnounceEpisodeBeforePlay = &t
@@ -285,4 +354,49 @@ func (c *MusicConfig) ApplyDefaults() {
 			c.Stories[i].EpisodePattern = DefaultEpisodePattern
 		}
 	}
+}
+
+// StringList 兼容三种 YAML 写法的字符串列表："kw"、"wy,kw"、[wy, kw]。
+type StringList []string
+
+// UnmarshalYAML 使用 yaml.v2/v3 都支持的旧式接口，避免 pkg/music 直接依赖 yaml 库。
+func (l *StringList) UnmarshalYAML(unmarshal func(any) error) error {
+	var list []string
+	if err := unmarshal(&list); err == nil {
+		*l = cleanStringList(list)
+		return nil
+	}
+	var single string
+	if err := unmarshal(&single); err != nil {
+		return err
+	}
+	*l = cleanStringList(strings.FieldsFunc(single, func(r rune) bool {
+		return r == ',' || r == '，' || r == ' ' || r == '/' || r == '|'
+	}))
+	return nil
+}
+
+// String 日志用。
+func (l StringList) String() string { return strings.Join(l, ",") }
+
+// First 第一个值，空列表返回 ""。
+func (l StringList) First() string {
+	if len(l) == 0 {
+		return ""
+	}
+	return l[0]
+}
+
+func cleanStringList(in []string) StringList {
+	out := make(StringList, 0, len(in))
+	seen := map[string]bool{}
+	for _, v := range in {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }

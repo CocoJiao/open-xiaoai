@@ -98,7 +98,7 @@ func TestHandlePlayFallsBackToLXWhenLocalSearchMisses(t *testing.T) {
 	}
 }
 
-func TestHandlePlayKeepsLXTrackOnlineEvenWhenDownloadEnabled(t *testing.T) {
+func TestHandlePlayDownloadsLXTrackWhenDownloadEnabled(t *testing.T) {
 	dir := t.TempDir()
 	abort := false
 	cfg := &MusicConfig{
@@ -146,11 +146,42 @@ func TestHandlePlayKeepsLXTrackOnlineEvenWhenDownloadEnabled(t *testing.T) {
 	if !module.handlePlay("周杰伦晴天") {
 		t.Fatal("expected handlePlay to handle LX fallback")
 	}
-	if resolver.downloadPath != "" {
-		t.Fatalf("普通播放不应下载歌曲，got %q", resolver.downloadPath)
+	if resolver.downloadPath == "" || filepath.Dir(resolver.downloadPath) != dir {
+		t.Fatalf("download=true 时播放应先下载到 dirs[0]，got %q", resolver.downloadPath)
 	}
-	if len(played) != 1 || played[0] != "https://lx.example/qingtian.mp3" {
-		t.Fatalf("expected online URL to be played, got %v", played)
+	if len(played) != 1 || !strings.HasPrefix(played[0], "http://music.local/file/") {
+		t.Fatalf("expected local file URL to be played, got %v", played)
+	}
+}
+
+type failingDownloadLX struct{ fakeLXResolver }
+
+func (f *failingDownloadLX) Download(ctx context.Context, track *LXTrack, targetPath string) error {
+	return fmt.Errorf("boom")
+}
+
+func TestHandlePlayFallsBackOnlineWhenDownloadFails(t *testing.T) {
+	dir := t.TempDir()
+	abort := false
+	cfg := &MusicConfig{
+		Enabled:  true,
+		Dirs:     []string{dir},
+		LX:       LXConfig{Enabled: true, Download: true},
+		HTTP:     HTTPConfig{Port: 18080, BaseURL: "http://music.local"},
+		Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort},
+	}
+	cfg.ApplyDefaults()
+	idx := NewIndexer(cfg)
+	fileSrv := NewFileServer(&cfg.HTTP)
+	played := []string{}
+	player := NewPlayer(fileSrv, idx)
+	player.playURL = func(url string) error { played = append(played, url); return nil }
+	player.speak = func(string) error { return nil }
+	lx := &failingDownloadLX{fakeLXResolver{track: &LXTrack{Name: "晴天", Singer: "周杰伦", URL: "https://lx.example/q.mp3"}}}
+	m := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player, lx: lx}
+	m.handlePlay("晴天")
+	if len(played) != 1 || played[0] != "https://lx.example/q.mp3" {
+		t.Fatalf("expected online fallback, got %v", played)
 	}
 }
 

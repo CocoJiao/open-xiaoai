@@ -89,6 +89,49 @@ func (i *Indexer) Random(n int) []IndexedSong {
 	return songs[:n]
 }
 
+// SearchByArtist 按歌手精确筛选本地曲库（"XX的歌"），按标题排序后返回。
+// 只看 artist 标签，不像 Search 那样混入标题/路径模糊命中，避免"周杰伦的歌"
+// 把别人翻唱的"xxx（原唱周杰伦）"也放进来。
+func (i *Indexer) SearchByArtist(artist string, maxResults int) []IndexedSong {
+	a := lxNormalize(artist)
+	if a == "" {
+		return nil
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	out := make([]IndexedSong, 0)
+	for _, s := range i.songs {
+		if s.ArtistLower == "" {
+			continue
+		}
+		for _, sg := range lxSplitSingers(s.ArtistLower) {
+			if sg == a {
+				out = append(out, s)
+				break
+			}
+		}
+	}
+	sort.SliceStable(out, func(x, y int) bool { return out[x].Path < out[y].Path })
+	log.Printf("🔍 [music/search] artist=%q 本地命中 %d 首", artist, len(out))
+	if maxResults > 0 && len(out) > maxResults {
+		rand.Shuffle(len(out), func(x, y int) { out[x], out[y] = out[y], out[x] })
+		out = out[:maxResults]
+	}
+	return out
+}
+
+// SongByPath 按路径查找已索引歌曲（恢复断点/播放收藏时拿回时长等元数据）。
+func (i *Indexer) SongByPath(path string) (IndexedSong, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	for _, s := range i.songs {
+		if s.Path == path {
+			return s, true
+		}
+	}
+	return IndexedSong{}, false
+}
+
 func containsAny(s IndexedSong, kw string) bool {
 	return searchScore(s, kw) > 0
 }

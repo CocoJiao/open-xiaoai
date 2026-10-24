@@ -22,9 +22,9 @@ import (
 // （Resolve/Download），对 Module 来说两者完全可以互换：New() 时根据
 // cfg.LX.Embedded 选其中一种。
 type EmbeddedLX struct {
-	registry *lxgo.Registry
-	source   string
-	quality  string
+	registry  *lxgo.Registry
+	sources   []string // 搜索平台，按优先级
+	qualities []string // 音质，按尝试顺序
 }
 
 // NewEmbeddedLX 加载 cfg.EmbeddedJSDir 目录下的音源脚本并启动内嵌 lx-go 引擎。
@@ -52,11 +52,16 @@ func NewEmbeddedLX(cfg *LXConfig) (*EmbeddedLX, error) {
 		log.Printf("✅ [music/lx-embedded] 内嵌 lx-go 加载完成，共 %d 个音源可用", len(registry.Sources))
 	}
 
-	quality := cfg.Quality
-	if quality == "" {
-		quality = "128k"
+	sources := []string(cfg.Source)
+	if len(sources) == 0 {
+		sources = []string{"kw"}
 	}
-	return &EmbeddedLX{registry: registry, source: cfg.Source, quality: quality}, nil
+	qualities := []string(cfg.Quality)
+	if len(qualities) == 0 {
+		qualities = []string{"128k"}
+	}
+	log.Printf("🌐 [music/lx-embedded] 搜索平台(优先级)=%v 音质(尝试顺序)=%v", sources, qualities)
+	return &EmbeddedLX{registry: registry, sources: sources, qualities: qualities}, nil
 }
 
 // Close 关闭内嵌引擎（停止所有音源脚本各自的 goja 事件循环）。Module.Stop() 时调用。
@@ -79,32 +84,76 @@ func (e *EmbeddedLX) Resolve(ctx context.Context, keyword string) (*LXTrack, err
 	if keyword == "" {
 		return nil, fmt.Errorf("lx-embedded keyword is empty")
 	}
-
-	log.Printf("🌐 [music/lx-embedded] search request: keyword=%q source=%s", keyword, e.source)
-	songs, sourceName, err := e.registry.Search(ctx, e.source, keyword, 20)
+	log.Printf("🌐 [music/lx-embedded] search request: keyword=%q platforms=%s", keyword, strings.Join(e.sources, ","))
+	groups, err := searchLXPlatforms(ctx, e.sources, keyword, e.searchPlatform(20))
 	if err != nil {
 		return nil, fmt.Errorf("lx-embedded search failed: %w", err)
 	}
-	if len(songs) == 0 {
-		return nil, fmt.Errorf("lx-embedded no result for %q", keyword)
-	}
-	song := songs[0]
-	log.Printf("🌐 [music/lx-embedded] search response: 音源=%s count=%d first=%s", sourceName, len(songs), briefJSON(song))
+	return resolveOrdered(rankLXGroups(keyword, groups), func(s lxSongInfo) (*LXTrack, error) {
+		return e.resolveSong(ctx, s)
+	})
+}
 
-	log.Printf("🌐 [music/lx-embedded] url request: song=%s quality=%s", briefJSON(song), e.quality)
-	remoteURL, urlSourceName, err := e.registry.ResolveURL(ctx, e.source, song, e.quality)
+func (e *EmbeddedLX) searchPlatform(limit int) func(ctx context.Context, platform, keyword string) ([]lxSongInfo, error) {
+	return func(ctx context.Context, platform, keyword string) ([]lxSongInfo, error) {
+		songs, sourceName, err := e.registry.Search(ctx, platform, keyword, limit)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("🌐 [music/lx-embedded] 平台 %s 由音源=%s 返回 %d 首", platform, sourceName, len(songs))
+		out := make([]lxSongInfo, len(songs))
+		for i, s := range songs {
+			out[i] = s
+		}
+		return out, nil
+	}
+}
+
+// resolveSong 按歌曲自己的平台（source 字段）取直链，并按配置的音质顺序逐个尝试。
+func (e *EmbeddedLX) resolveSong(ctx context.Context, song lxSongInfo) (*LXTrack, error) {
+	platform := stringField(song, "source")
+	if platform == "" && len(e.sources) > 0 {
+		platform = e.sources[0]
+	}
+	return resolveWithQualities(e.qualities, func(q string) (*LXTrack, error) {
+		log.Printf("🌐 [music/lx-embedded] url request: [%s] %s - %s quality=%s", platform,
+			stringField(song, "name"), stringField(song, "singer"), q)
+		remoteURL, urlSourceName, err := e.registry.ResolveURL(ctx, platform, song, q)
+		if err != nil {
+			return nil, fmt.Errorf("lx-embedded resolve url failed: %w", err)
+		}
+		log.Printf("🌐 [music/lx-embedded] url response: 音源=%s quality=%s url=%s", urlSourceName, q, remoteURL)
+		return &LXTrack{
+			Name:       stringField(song, "name"),
+			Singer:     stringField(song, "singer"),
+			Source:     platform,
+			Quality:    q,
+			URL:        remoteURL,
+			DurationMs: parseIntervalMs(stringField(song, "interval")),
+		}, nil
+	})
+}
+
+// SearchArtistSongs 实现 lxArtistSearcher："XX的歌"在所有配置平台搜索，只保留歌手匹配的结果。
+func (e *EmbeddedLX) SearchArtistSongs(ctx context.Context, artist string, limit int) ([]LXCandidate, error) {
+	if e == nil || e.registry == nil {
+		return nil, fmt.Errorf("embedded lx-go is not initialized")
+	}
+	groups, err := searchLXPlatforms(ctx, e.sources, strings.TrimSpace(artist), e.searchPlatform(50))
 	if err != nil {
-		return nil, fmt.Errorf("lx-embedded resolve url failed: %w", err)
+		return nil, fmt.Errorf("lx-embedded search failed: %w", err)
 	}
-	log.Printf("🌐 [music/lx-embedded] url response: 音源=%s url=%s", urlSourceName, remoteURL)
+	filtered := filterLXSongsBySinger(artist, flattenLXGroups(groups), limit)
+	log.Printf("🌐 [music/lx-embedded] artist search: artist=%q 歌手匹配=%d", artist, len(filtered))
+	return candidatesFromSongs(filtered), nil
+}
 
-	return &LXTrack{
-		Name:    stringField(song, "name"),
-		Singer:  stringField(song, "singer"),
-		Source:  stringField(song, "source"),
-		Quality: e.quality,
-		URL:     remoteURL,
-	}, nil
+// ResolveCandidate 实现 lxArtistSearcher。
+func (e *EmbeddedLX) ResolveCandidate(ctx context.Context, c LXCandidate) (*LXTrack, error) {
+	if e == nil || e.registry == nil {
+		return nil, fmt.Errorf("embedded lx-go is not initialized")
+	}
+	return e.resolveSong(ctx, c.info)
 }
 
 // Download 实现 lxResolver：把 track.URL 指向的直链下载保存到本地。
